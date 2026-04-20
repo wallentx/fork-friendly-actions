@@ -1,0 +1,24 @@
+{
+  "name": "fork-friendly-actions",
+  "version": "0.1.0",
+  "description": "Evaluate and fix GitHub Actions workflows for fork-hostile CI patterns.",
+  "type": "commonjs",
+  "bin": {
+    "fork-friendly-actions": "bin/fork-friendly-actions.js"
+  },
+  "files": [
+    "action.yml",
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:standalone": "node scripts/build-standalone.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

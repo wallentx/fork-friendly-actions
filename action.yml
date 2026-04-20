@@ -1,0 +1,45 @@
+name: Fork Friendly Actions
+author: William Allen
+description: Evaluate and optionally fix GitHub Actions workflows for fork-hostile CI patterns.
+inputs:
+  workflows:
+    description: Directory containing workflow files to audit.
+    required: false
+    default: .github/workflows
+  upstream-owner:
+    description: Repository owner that is allowed to use private runners, secrets, and publish jobs. Defaults to the current repository owner.
+    required: false
+    default: ""
+  fail-on:
+    description: Minimum severity that should fail the action. One of error, warning, or none. Defaults to error in check mode and none in fix mode.
+    required: false
+    default: ""
+  mode:
+    description: Whether to only check workflows or also apply fixes. One of check or fix.
+    required: false
+    default: check
+  allow-runners:
+    description: Comma-separated extra runner labels to treat as fork-friendly.
+    required: false
+    default: ""
+  runner-fallback:
+    description: Public GitHub-hosted runner label to use when replacing private runners for forks.
+    required: false
+    default: ubuntu-latest
+outputs:
+  findings-count:
+    description: Total number of findings.
+  error-count:
+    description: Number of error findings.
+  warning-count:
+    description: Number of warning findings.
+  changes-count:
+    description: Number of changes applied when mode is fix.
+  markdown-summary:
+    description: Markdown summary of findings.
+runs:
+  using: node20
+  main: src/action.js
+branding:
+  icon: git-pull-request
+  color: green
