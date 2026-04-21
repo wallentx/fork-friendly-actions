@@ -14,6 +14,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "build": "npm run test && npm run build:standalone",
     "build:standalone": "node scripts/build-standalone.js",
     "test": "node --test"
   },
