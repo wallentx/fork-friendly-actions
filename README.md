@@ -25,6 +25,11 @@ npx fork-friendly-actions
 
 By default, the CLI runs `fix`, evaluates `.github/workflows`, detects the
 upstream owner from `remote.origin.url`, and writes changes for fixable issues.
+You can also pass `--fix` explicitly:
+
+```sh
+npx fork-friendly-actions --fix
+```
 
 To create one standalone file that can live anywhere on your `PATH`:
 

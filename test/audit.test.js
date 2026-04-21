@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { auditWorkflowFile, fixWorkflowFile, parseRunnerLabels, shouldFail } = require("../src/index.js");
-const { parseOwnerFromRemote } = require("../bin/fork-friendly-actions.js");
+const { parseArgs, parseOwnerFromRemote } = require("../bin/fork-friendly-actions.js");
 
 function audit(source) {
   return auditWorkflowFile({
@@ -56,6 +56,21 @@ jobs:
   start_release:
     if: github.repository_owner == 'Chia-Network'
     runs-on: [glue-notify]
+    steps:
+      - run: ./start-release.sh
+`);
+
+  assert.deepEqual(findings, []);
+});
+
+test("allows dynamic runners on owner-gated jobs", () => {
+  const findings = audit(`
+name: Release
+on: push
+jobs:
+  start_release:
+    if: github.repository_owner == 'Chia-Network'
+    runs-on: \${{ matrix.runner }}
     steps:
       - run: ./start-release.sh
 `);
@@ -191,7 +206,34 @@ jobs:
   assert.doesNotMatch(result.fixedSource, /- self-hosted/);
 });
 
+test("fixes dynamic runner expressions with an owner-gated public fallback", () => {
+  const result = fixWorkflowFile({
+    filePath: "/repo/.github/workflows/ci.yml",
+    source: `
+name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: \${{ matrix.runs_on || matrix.runner }}
+    steps:
+      - run: npm test
+`,
+    cwd: "/repo",
+    upstreamOwner: "ExampleOrg",
+  });
+
+  assert.match(result.fixedSource, /runs-on: \$\{\{ github\.repository_owner == 'ExampleOrg' && \(matrix\.runs_on \|\| matrix\.runner\) \|\| 'ubuntu-latest' \}\}/);
+  assert.equal(result.changes.length, 1);
+  assert.equal(result.findings[0].fixable, true);
+});
+
 test("parses GitHub remote owners", () => {
   assert.equal(parseOwnerFromRemote("git@github.com:wallentx/fork-friendly-actions.git"), "wallentx");
   assert.equal(parseOwnerFromRemote("https://github.com/Chia-Network/chia-blockchain.git"), "Chia-Network");
+});
+
+test("parses --fix and --check command aliases", () => {
+  assert.equal(parseArgs(["--fix"]).command, "fix");
+  assert.equal(parseArgs(["--check"]).command, "check");
+  assert.throws(() => parseArgs(["check", "--fix"]), /cannot be combined/);
 });

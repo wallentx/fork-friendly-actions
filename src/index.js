@@ -368,9 +368,12 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamOwner, a
     const raw = runsOn.raw;
     const hasOwnerExpression = OWNER_GUARD_PATTERNS.some((pattern) => pattern.test(raw));
     const hasFallback = /&&/.test(raw) && /\|\|/.test(raw);
+    if (guard?.hasOwnerGuard) {
+      return { fixable: false, findings: [] };
+    }
     if (!hasOwnerExpression || !hasFallback) {
       return {
-        fixable: false,
+        fixable: Boolean(upstreamOwner),
         findings: [
           {
             severity: "warning",
@@ -378,7 +381,7 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamOwner, a
             line: lineNumber,
             title: "Dynamic runner expression needs a fork fallback",
             message: `Dynamic runs-on expressions should clearly choose a public GitHub-hosted runner when the workflow runs outside the upstream repository.${formatOwnerHint(upstreamOwner)}`,
-            fixable: false,
+            fixable: Boolean(upstreamOwner),
           },
         ],
       };
@@ -407,8 +410,13 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamOwner, a
 }
 
 function makeRunsOnEdit({ lines, runsOn, upstreamOwner, runnerFallback }) {
-  const originalRunner = runnerExpressionValue(runsOn.labels);
-  const fallbackRunner = runnerExpressionValue([runnerFallback || DEFAULT_RUNNER_FALLBACK], runsOn.labels.length > 1);
+  const originalRunner = runsOn.isExpression
+    ? `(${stripExpressionDelimiters(runsOn.raw)})`
+    : runnerExpressionValue(runsOn.labels);
+  const fallbackRunner = runnerExpressionValue(
+    [runnerFallback || DEFAULT_RUNNER_FALLBACK],
+    !runsOn.isExpression && runsOn.labels.length > 1
+  );
   const expression = `\${{ github.repository_owner == '${escapeExpressionString(upstreamOwner)}' && ${originalRunner} || ${fallbackRunner} }}`;
   return {
     start: runsOn.startIndex,
@@ -417,6 +425,12 @@ function makeRunsOnEdit({ lines, runsOn, upstreamOwner, runnerFallback }) {
     title: "Add fork runner fallback",
     key: `replace:${runsOn.startIndex}:${runsOn.endIndex}:runs-on`,
   };
+}
+
+function stripExpressionDelimiters(value) {
+  const trimmed = String(value).trim();
+  const match = trimmed.match(/^\$\{\{\s*([\s\S]*?)\s*\}\}$/);
+  return match ? match[1].trim() : trimmed;
 }
 
 function runnerExpressionValue(labels, forceArray = false) {

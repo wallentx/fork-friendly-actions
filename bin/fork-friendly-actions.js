@@ -68,6 +68,12 @@ function parseArgs(argv) {
       case "--dry-run":
         parsed.dryRun = true;
         break;
+      case "--fix":
+        parsed.command = setCommand(parsed.command, "fix", arg);
+        break;
+      case "--check":
+        parsed.command = setCommand(parsed.command, "check", arg);
+        break;
       case "--cwd":
         parsed.cwd = requireValue(args, (index += 1), arg);
         break;
@@ -95,6 +101,13 @@ function parseArgs(argv) {
   }
 
   return parsed;
+}
+
+function setCommand(currentCommand, nextCommand, flag) {
+  if (currentCommand && currentCommand !== nextCommand) {
+    throw new Error(`${flag} cannot be combined with the ${currentCommand} command.`);
+  }
+  return nextCommand;
 }
 
 function requireValue(args, index, flag) {
@@ -171,6 +184,8 @@ Commands:
   check    Evaluate workflows without changing files.
 
 Options:
+  --fix                       Run fix mode. Same as the fix command.
+  --check                     Run check mode. Same as the check command.
   --workflows <path>          Workflow file or directory. Default: ${DEFAULT_WORKFLOWS_DIR}
   --upstream-owner <owner>    Owner allowed to use private runners, secrets, and publish steps.
   --runner-fallback <label>   Public runner label to use for fork fallbacks. Default: ${DEFAULT_RUNNER_FALLBACK}
