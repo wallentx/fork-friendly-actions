@@ -59,6 +59,11 @@ const OWNER_GUARD_PATTERNS = [
   /github\.repository_owner\s*!=/,
   /github\.repository\s*==/,
   /github\.repository\s*!=/,
+  /github\.event_name\s*!=\s*['"]pull_request['"]/,
+  /github\.event_name\s*==\s*['"]push['"]/,
+  /github\.event_name\s*==\s*['"]schedule['"]/,
+  /github\.event\.pull_request\.head\.repo\.full_name\s*==\s*github\.repository/,
+  /github\.event\.pull_request\.head\.repo\.fork\s*==\s*false/,
 ];
 
 const PUBLISH_USES_PATTERNS = [
@@ -203,6 +208,7 @@ function evaluateWorkflows({
   const files = discoverWorkflowFiles(workflowsPath);
   const findings = [];
   const changes = [];
+  const fileChanges = [];
 
   for (const filePath of files) {
     const source = fs.readFileSync(filePath, "utf8");
@@ -218,8 +224,15 @@ function evaluateWorkflows({
     });
     findings.push(...result.findings);
     changes.push(...result.changes);
-    if (mode === "fix" && result.fixedSource !== source && !dryRun) {
-      fs.writeFileSync(filePath, result.fixedSource);
+    if (mode === "fix" && result.fixedSource !== source) {
+      fileChanges.push({
+        file: result.changes[0]?.file || path.relative(cwd, filePath),
+        originalSource: source,
+        fixedSource: result.fixedSource,
+      });
+      if (!dryRun) {
+        fs.writeFileSync(filePath, result.fixedSource);
+      }
     }
   }
 
@@ -227,6 +240,7 @@ function evaluateWorkflows({
     files,
     findings,
     changes,
+    fileChanges,
     changedFiles: [...new Set(changes.map((change) => change.file))],
     summary: summarizeFindings(findings, changes),
   };
@@ -580,7 +594,10 @@ function evaluateWorkflowFile({
     changes: normalizedEdits.map((edit) => ({
       file: relativeFile,
       line: edit.start + 1,
+      start: edit.start,
+      end: edit.end,
       title: edit.title,
+      replacement: edit.replacement,
     })),
     fixedSource: fixedLines.join(lineEnding),
   };
@@ -1365,6 +1382,9 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamScope, a
       };
     }
     if (!hasOwnerExpression || !hasFallback) {
+      const why = matrixResolution.referencedKeys && matrixResolution.referencedKeys.length > 0
+        ? `Dynamic runs-on expression ${raw} depends on matrix values that could not be fully resolved to known public runners.`
+        : `Dynamic runs-on expression ${raw} cannot be locally resolved to a known public GitHub-hosted runner.`;
       return {
         fixable: Boolean(upstreamScope.guardExpression),
         fixKind: "runs-on-fallback",
@@ -1378,7 +1398,7 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamScope, a
             rule: RULES.RUNNER_EXPRESSION.slug,
             ruleCode: RULES.RUNNER_EXPRESSION.code,
             title: "Dynamic runner expression needs a fork fallback",
-            message: `Dynamic runs-on expressions should clearly choose a known free public GitHub-hosted runner when the workflow runs outside the upstream repository.${formatScopeHint(upstreamScope)}`,
+            message: `${why} Dynamic expressions should clearly choose a known free public GitHub-hosted runner when the workflow runs outside the upstream repository.${formatScopeHint(upstreamScope)}`,
             fixable: Boolean(upstreamScope.guardExpression),
           },
         ],

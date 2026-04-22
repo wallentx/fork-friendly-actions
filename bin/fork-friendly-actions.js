@@ -22,15 +22,11 @@ function main(argv) {
   }
 
   const cwd = path.resolve(parsed.cwd || process.cwd());
-  const command = parsed.command || "check";
+  const fixMode = Boolean(parsed.fix);
   const upstreamRepo = parsed.upstreamRepo || detectRepoSlugFromGit(cwd);
   const upstreamOwner = parsed.upstreamOwner || ownerFromRepoSlug(upstreamRepo);
 
-  if (!["check", "fix"].includes(command)) {
-    throw new Error(`Unknown command: ${command}`);
-  }
-
-  if (command === "fix" && !upstreamRepo && !upstreamOwner) {
+  if (fixMode && !upstreamRepo && !upstreamOwner) {
     throw new Error("Could not detect the upstream repository from git remotes. Pass --upstream-repo <owner/repo> or --upstream-owner <owner>.");
   }
 
@@ -43,24 +39,19 @@ function main(argv) {
     runnerFallback: parsed.runnerFallback || DEFAULT_RUNNER_FALLBACK,
   };
 
-  const result =
-    command === "fix"
-      ? fixWorkflows({ ...options, dryRun: parsed.dryRun })
-      : auditWorkflows(options);
+  const result = fixMode
+    ? fixWorkflows({ ...options, dryRun: parsed.dryRun })
+    : auditWorkflows(options);
 
-  printResult(result, { command, cwd, dryRun: parsed.dryRun });
+  printResult(result, { fixMode, cwd, dryRun: parsed.dryRun });
 
-  const failOn = parsed.failOn || (command === "check" ? "error" : "none");
+  const failOn = parsed.failOn || (fixMode ? "none" : "error");
   return shouldFail(result.findings, failOn) ? 1 : 0;
 }
 
 function parseArgs(argv) {
   const parsed = {};
   const args = [...argv];
-
-  if (args[0] && !args[0].startsWith("-")) {
-    parsed.command = args.shift();
-  }
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -70,51 +61,51 @@ function parseArgs(argv) {
         parsed.help = true;
         break;
       case "--dry-run":
+      case "-d":
         parsed.dryRun = true;
+        parsed.fix = true;
         break;
       case "--fix":
-        parsed.command = setCommand(parsed.command, "fix", arg);
-        break;
-      case "--check":
-        parsed.command = setCommand(parsed.command, "check", arg);
-        break;
-      case "--cwd":
-        parsed.cwd = requireValue(args, (index += 1), arg);
+      case "-f":
+        parsed.fix = true;
         break;
       case "--workflows":
+      case "-w":
         parsed.workflows = requireValue(args, (index += 1), arg);
         break;
       case "--upstream-owner":
+      case "-o":
         parsed.upstreamOwner = requireValue(args, (index += 1), arg);
         break;
       case "--upstream-repo":
+      case "-r":
         parsed.upstreamRepo = requireValue(args, (index += 1), arg);
         break;
       case "--allow-runners":
+      case "-a":
         parsed.allowRunners = requireValue(args, (index += 1), arg);
         break;
       case "--runner-fallback":
+      case "-R":
         parsed.runnerFallback = requireValue(args, (index += 1), arg);
         break;
       case "--fail-on":
+      case "-l":
         parsed.failOn = requireValue(args, (index += 1), arg);
         if (!["error", "warning", "none"].includes(parsed.failOn)) {
           throw new Error("--fail-on must be error, warning, or none.");
         }
         break;
       default:
-        throw new Error(`Unknown option: ${arg}`);
+        if (!arg.startsWith("-") && !parsed.cwd) {
+          parsed.cwd = arg;
+        } else {
+          throw new Error(`Unknown option: ${arg}`);
+        }
     }
   }
 
   return parsed;
-}
-
-function setCommand(currentCommand, nextCommand, flag) {
-  if (currentCommand && currentCommand !== nextCommand) {
-    throw new Error(`${flag} cannot be combined with the ${currentCommand} command.`);
-  }
-  return nextCommand;
 }
 
 function requireValue(args, index, flag) {
@@ -167,30 +158,71 @@ function parseOwnerFromRemote(remote) {
   return ownerFromRepoSlug(parseRepoSlugFromRemote(remote));
 }
 
-function printResult(result, { command, cwd, dryRun }) {
+function printResult(result, { fixMode, cwd, dryRun }) {
   if (result.files.length === 0) {
     console.log("No workflow files found.");
     return;
   }
 
   if (result.findings.length === 0) {
-    const summary = `${command === "fix" ? "updated" : "checked"} ${result.files.length} workflow file${result.files.length === 1 ? "" : "s"}`;
+    const summary = `${fixMode ? "updated" : "checked"} ${result.files.length} workflow file${result.files.length === 1 ? "" : "s"}`;
     console.log(`ffactions: no issues found (${summary})`);
     return;
   }
 
   const fileLineCache = new Map();
+
+  if (dryRun) {
+    if (result.fileChanges && result.fileChanges.length > 0) {
+      console.log(paint("cyan", "Dry Run Diff:"));
+      console.log("");
+      for (const { file, originalSource, fixedSource } of result.fileChanges) {
+        const tmpDir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "ffactions-diff-"));
+        const originalPath = path.join(tmpDir, "a.yml");
+        const fixedPath = path.join(tmpDir, "b.yml");
+        fs.writeFileSync(originalPath, originalSource);
+        fs.writeFileSync(fixedPath, fixedSource);
+
+        try {
+          const diffArgs = ["diff", "--no-index", "--unified=3"];
+          if (supportsColor()) {
+            diffArgs.push("--color=always");
+          }
+          diffArgs.push(originalPath, fixedPath);
+          const diffResult = childProcess.spawnSync("git", diffArgs, { encoding: "utf8" });
+          
+          let diffOutput = diffResult.stdout || "";
+          diffOutput = diffOutput.replace(new RegExp(escapeRegExp(originalPath), "g"), `a/${file}`);
+          diffOutput = diffOutput.replace(new RegExp(escapeRegExp(fixedPath), "g"), `b/${file}`);
+          console.log(diffOutput.trimEnd());
+          console.log("");
+        } catch (e) {
+          // If git is missing, fallback gracefully
+          console.log(paint("yellow", `--- a/${file}`));
+          console.log(paint("yellow", `+++ b/${file}`));
+          console.log(paint("gray", "(install git for full diff output)"));
+          console.log("");
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      }
+    } else {
+      console.log("No fixable changes found.");
+    }
+    console.log(`Would apply ${result.changes.length} change${result.changes.length === 1 ? "" : "s"} across ${result.changedFiles.length} file${result.changedFiles.length === 1 ? "" : "s"}.`);
+    return;
+  }
+
   const groupedFindings = groupFindingsByRule(result.findings);
 
   for (const group of groupedFindings) {
-    printRuleGroup(group, { cwd, fileLineCache, command });
+    printRuleGroup(group, { cwd, fileLineCache, fixMode });
   }
 
   console.log("");
   console.log(`${result.findings.length} finding${result.findings.length === 1 ? "" : "s"} in ${result.files.length} workflow file${result.files.length === 1 ? "" : "s"}.`);
-  if (command === "fix") {
-    const verb = dryRun ? "Would apply" : "Applied";
-    console.log(`${verb} ${result.changes.length} change${result.changes.length === 1 ? "" : "s"} across ${result.changedFiles.length} file${result.changedFiles.length === 1 ? "" : "s"}.`);
+  if (fixMode) {
+    console.log(`Applied ${result.changes.length} change${result.changes.length === 1 ? "" : "s"} across ${result.changedFiles.length} file${result.changedFiles.length === 1 ? "" : "s"}.`);
   }
 }
 
@@ -231,7 +263,7 @@ function lookupRuleMeta(finding) {
   };
 }
 
-function printRuleGroup(group, { cwd, fileLineCache, command }) {
+function printRuleGroup(group, { cwd, fileLineCache, fixMode }) {
   const header = `${group.meta.code} ${group.meta.slug}: ${group.meta.title}`;
   console.log(paint("yellow", header));
   if (group.meta.description) {
@@ -243,7 +275,7 @@ function printRuleGroup(group, { cwd, fileLineCache, command }) {
 
   const fileGroups = groupFindingsByFile(group.findings);
   for (const fileGroup of fileGroups) {
-    printFileGroup(fileGroup, { cwd, fileLineCache, command, rule: group.meta });
+    printFileGroup(fileGroup, { cwd, fileLineCache, fixMode, rule: group.meta });
   }
 }
 
@@ -264,7 +296,7 @@ function groupFindingsByFile(findings) {
   return files;
 }
 
-function printFileGroup(fileGroup, { cwd, fileLineCache, command, rule }) {
+function printFileGroup(fileGroup, { cwd, fileLineCache, fixMode, rule }) {
   const filePath = path.resolve(cwd, fileGroup.file);
   const fileLines = readFileLines(filePath, fileLineCache);
   const entries = clusterFindings(fileGroup.findings, rule, fileLines);
@@ -276,7 +308,7 @@ function printFileGroup(fileGroup, { cwd, fileLineCache, command, rule }) {
 
   console.log(`${paint("cyan", fileGroup.file)} ${paint("gray", `(${fileGroup.findings.length} finding${fileGroup.findings.length === 1 ? "" : "s"})`)}`);
   for (const entry of entries) {
-    printEntry(entry, { fileLines, maxLineDigits, command });
+    printEntry(entry, { fileLines, maxLineDigits, fixMode });
   }
   console.log("");
 }
@@ -376,15 +408,14 @@ function extractSecretNamesFromMessage(message) {
   return matches ? matches.map((item) => item.replace(/^secrets\./, "")) : [];
 }
 
-function printEntry(entry, { fileLines, maxLineDigits, command }) {
+function printEntry(entry, { fileLines, maxLineDigits, fixMode }) {
   const firstHighlight = resolveHighlight(fileLines, entry.findings[0]);
   const location = `${entry.file}:${entry.startLine}:${firstHighlight.column}`;
+  const isFixable = entry.findings.some((finding) => finding.fixable);
+  const fixIcon = isFixable ? "✅" : "⚠️";
 
-  console.log(`${paint("yellow", "  -")} ${paint("yellow", location)} ${paint("gray", `(${entry.note})`)}`);
+  console.log(`${paint("yellow", "  -")} ${fixIcon} ${paint("yellow", location)} ${paint("gray", `(${entry.note})`)}`);
   printSnippet(fileLines, entry, maxLineDigits);
-  if (entry.findings.some((finding) => finding.fixable) && command === "check") {
-    console.log(`${paint("gray", "      =")} auto-fix available with ${paint("cyan", "`ffactions fix`")}`);
-  }
 }
 
 function readFileLines(filePath, fileLineCache) {
@@ -480,6 +511,10 @@ function firstVisibleColumn(lineText) {
   return index === -1 ? 1 : index + 1;
 }
 
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function supportsColor() {
   if (process.env.NO_COLOR) {
     return false;
@@ -497,6 +532,8 @@ function paint(color, text) {
 
   const codes = {
     gray: "\u001b[90m",
+    red: "\u001b[31m",
+    green: "\u001b[32m",
     yellow: "\u001b[33m",
     cyan: "\u001b[36m",
   };
@@ -510,30 +547,25 @@ function printHelp() {
 Evaluate GitHub Actions workflows and make them friendlier to forked PRs.
 
 Usage:
-  fork-friendly-actions [options]
-  fork-friendly-actions fix [options]
-  fork-friendly-actions check [options]
+  fork-friendly-actions [options] [path]
 
 Default upstream scope detection:
   ffactions detects the upstream repository slug from git remotes.
   It prefers the upstream remote and falls back to origin.
 
-Commands:
-  check    Evaluate workflows without changing files. Default.
-  fix      Evaluate workflows and rewrite fixable fork-hostile patterns.
-
 Options:
-  --fix                       Run fix mode. Same as the fix command.
-  --check                     Run check mode. Same as the check command.
-  --workflows <path>          Workflow file or directory. Default: ${DEFAULT_WORKFLOWS_DIR}
-  --upstream-repo <owner/repo> Override the detected upstream repository slug for fork gating.
-  --upstream-owner <owner>    Override the detected upstream owner when no repo slug is available.
-  --runner-fallback <label>   Public runner label to use for fork fallbacks. Default: ${DEFAULT_RUNNER_FALLBACK}
-  --allow-runners <labels>    Comma-separated extra runner labels to treat as fork-friendly.
-  --fail-on <level>           Exit nonzero at error, warning, or none. Default: error for check, none for fix.
-  --dry-run                   Print what would change without writing files.
-  --cwd <path>                Project checkout to evaluate. Default: current directory.
-  --help                      Show this help.
+  -f, --fix                   Evaluate workflows and rewrite fixable fork-hostile patterns.
+  -w, --workflows <path>      Workflow file or directory. Default: ${DEFAULT_WORKFLOWS_DIR}
+  -r, --upstream-repo <slug>  Override the detected upstream repository slug for fork gating.
+  -o, --upstream-owner <name> Override the detected upstream owner when no repo slug is available.
+  -R, --runner-fallback <lbl> Public runner label to use for fork fallbacks. Default: ${DEFAULT_RUNNER_FALLBACK}
+  -a, --allow-runners <lbls>  Comma-separated extra runner labels to treat as fork-friendly.
+  -l, --fail-on <level>       Exit nonzero at error, warning, or none. Default: error (none when --fix is used).
+  -d, --dry-run               Print what would change without writing files.
+  -h, --help                  Show this help.
+
+Arguments:
+  [path]                      Project checkout to evaluate. Default: current directory.
 `);
 }
 

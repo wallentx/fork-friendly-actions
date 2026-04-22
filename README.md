@@ -28,15 +28,15 @@ Run this from a project checkout:
 npx fork-friendly-actions
 ```
 
-By default, the CLI runs `check`, evaluates `.github/workflows`, and reports
-findings without changing files. For fork workflows, it prefers the `upstream`
-git remote and falls back to `origin` to determine the upstream repository
-scope. That repo slug is the default source of truth for gating and fixes.
+By default, the CLI evaluates `.github/workflows` and reports findings without
+changing files. For fork workflows, it prefers the `upstream` git remote and
+falls back to `origin` to determine the upstream repository scope. That repo
+slug is the default source of truth for gating and fixes.
 
-To apply fixable changes, run `fix` explicitly:
+To apply fixable changes, use the `-f` or `--fix` flag:
 
 ```sh
-npx fork-friendly-actions fix
+npx fork-friendly-actions --fix
 ```
 
 To create one standalone file that can live anywhere on your `PATH`:
@@ -55,32 +55,32 @@ ffactions
 Preview changes without writing files:
 
 ```sh
-npx fork-friendly-actions fix --dry-run
-```
-
-Only evaluate workflows:
-
-```sh
-npx fork-friendly-actions check
+npx fork-friendly-actions --fix --dry-run
 ```
 
 Pass the full upstream repository explicitly when the checkout has no usable git
 remotes or when you want to override detection:
 
 ```sh
-npx fork-friendly-actions fix --upstream-repo ExampleOrg/example-repo
+npx fork-friendly-actions --fix --upstream-repo ExampleOrg/example-repo
 ```
 
 Pass only the owner when no repo slug is available:
 
 ```sh
-npx fork-friendly-actions fix --upstream-owner ExampleOrg
+npx fork-friendly-actions --fix --upstream-owner ExampleOrg
 ```
 
 Use a different public fallback runner:
 
 ```sh
-npx fork-friendly-actions fix --runner-fallback ubuntu-22.04-arm
+npx fork-friendly-actions --fix --runner-fallback ubuntu-22.04-arm
+```
+
+Run against a specific directory (defaults to current directory):
+
+```sh
+npx fork-friendly-actions path/to/project
 ```
 
 Refresh the committed public-runner list from GitHub Docs:

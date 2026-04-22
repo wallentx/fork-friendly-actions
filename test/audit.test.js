@@ -1010,11 +1010,18 @@ test("derives owner and guard expressions from upstream repo scope", () => {
   );
 });
 
-test("parses --fix and --check command aliases", () => {
-  assert.equal(parseArgs(["--fix"]).command, "fix");
-  assert.equal(parseArgs(["--check"]).command, "check");
-  assert.equal(parseArgs(["--upstream-repo", "openai/codex"]).upstreamRepo, "openai/codex");
-  assert.throws(() => parseArgs(["check", "--fix"]), /cannot be combined/);
+test("parses short aliases and positional path", () => {
+  assert.equal(parseArgs(["--fix"]).fix, true);
+  assert.equal(parseArgs(["-f"]).fix, true);
+  assert.equal(parseArgs(["-r", "openai/codex"]).upstreamRepo, "openai/codex");
+  assert.equal(parseArgs(["-w", "some/path"]).workflows, "some/path");
+  assert.equal(parseArgs(["-d"]).dryRun, true);
+  assert.equal(parseArgs(["-a", "runner1"]).allowRunners, "runner1");
+  assert.equal(parseArgs(["-o", "Org"]).upstreamOwner, "Org");
+  assert.equal(parseArgs(["-R", "fallback"]).runnerFallback, "fallback");
+  assert.equal(parseArgs(["-l", "none"]).failOn, "none");
+  assert.equal(parseArgs(["my/path"]).cwd, "my/path");
+  assert.equal(parseArgs(["-f", "my/path"]).cwd, "my/path");
 });
 
 test("rule codes use stable FFxxx identifiers", () => {
@@ -1039,15 +1046,16 @@ jobs:
 `;
   fs.writeFileSync(workflowPath, original);
 
-  const result = childProcess.spawnSync(process.execPath, ["bin/fork-friendly-actions.js", "--cwd", tmpDir, "--upstream-owner", "ExampleOrg"], {
+  const result = childProcess.spawnSync(process.execPath, ["bin/fork-friendly-actions.js", tmpDir, "-o", "ExampleOrg"], {
     cwd: path.resolve(__dirname, ".."),
     encoding: "utf8",
+    env: { ...process.env, NO_COLOR: "1" },
   });
 
   assert.equal(result.status, 1);
   assert.match(result.stdout, /FF001 runner-label: Private runner is not fork-friendly/);
   assert.match(result.stdout, /\.github\/workflows\/ci\.yml \(1 finding\)/);
-  assert.match(result.stdout, /- \.github\/workflows\/ci\.yml:5:5 \(runner label: benchmark\)/);
+  assert.match(result.stdout, /- (?:✅|⚠️) \.github\/workflows\/ci\.yml:5:5 \(runner label: benchmark\)/);
   assert.match(result.stdout, /4 \|   benchmark:/);
   assert.match(result.stdout, /5 \|     runs-on: benchmark/);
   assert.match(result.stdout, /6 \|     steps:/);
@@ -1070,16 +1078,38 @@ jobs:
 `
   );
 
-  const result = childProcess.spawnSync(process.execPath, ["bin/fork-friendly-actions.js", "--cwd", tmpDir, "--upstream-owner", "ExampleOrg"], {
+  const result = childProcess.spawnSync(process.execPath, ["bin/fork-friendly-actions.js", tmpDir, "-o", "ExampleOrg"], {
     cwd: path.resolve(__dirname, ".."),
     encoding: "utf8",
+    env: { ...process.env, NO_COLOR: "1" },
   });
 
   assert.equal(result.status, 0);
   assert.match(result.stdout, /FF003 secret-gate: Secret usage is not owner-gated/);
-  assert.match(result.stdout, /- \.github\/workflows\/reuse\.yml:6:5 \(secrets: inherit\)/);
+  assert.match(result.stdout, /- (?:✅|⚠️) \.github\/workflows\/reuse\.yml:6:5 \(secrets: inherit\)/);
   assert.match(result.stdout, /6 \|     secrets: inherit/);
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("flags unresolved dynamic inputs.runs-on in reusable workflows", () => {
+  const findings = audit(`
+name: Reusable
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: ubuntu-latest
+jobs:
+  test:
+    runs-on: \${{ inputs.runs-on }}
+    steps:
+      - run: echo hello
+`);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.RUNNER_EXPRESSION.code);
+  assert.match(findings[0].message, /cannot be locally resolved to a known public GitHub-hosted runner/);
 });
 
 test("workflow template lives outside marketplace-disqualifying workflow paths", () => {
