@@ -2,6 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const YAML = require("yaml");
 
 const DEFAULT_WORKFLOWS_DIR = ".github/workflows";
 const DEFAULT_RUNNER_FALLBACK = "ubuntu-latest";
@@ -33,6 +34,24 @@ const RULES = Object.freeze({
     title: "Publish, deploy, or auth step is not upstream-gated",
     description: "Publishing, deployment, release-write, and cloud-auth steps should usually be skipped on forks with an upstream guard.",
   },
+  SNAPSHOT_GATE: {
+    code: "FF005",
+    slug: "snapshot-gate",
+    title: "Snapshot job is not upstream-gated",
+    description: "Jobs that generate runner snapshots or custom images should usually be skipped on forks with an upstream guard.",
+  },
+  NEEDS_GATE: {
+    code: "FF006",
+    slug: "needs-gate",
+    title: "Dependent job is not upstream-gated",
+    description: "If a job depends on another job that is upstream-only or skipped on forks, the dependent job should also be upstream-gated.",
+  },
+  OUTPUT_GATE: {
+    code: "FF007",
+    slug: "output-gate",
+    title: "Output dependency is not upstream-gated",
+    description: "If a step, job output, or reusable workflow output depends on an upstream-only producer, the consumer should also be upstream-gated.",
+  },
 });
 
 const OWNER_GUARD_PATTERNS = [
@@ -58,6 +77,10 @@ const PUBLISH_RUN_PATTERNS = [
   /\bdocker\s+push\b/i,
   /\bgh\s+release\s+(create|upload|edit|delete)\b/i,
 ];
+
+const STEP_OUTPUT_REFERENCE_PATTERN = /\bsteps\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
+const NEEDS_OUTPUT_REFERENCE_PATTERN = /\bneeds\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
+const JOB_OUTPUT_REFERENCE_PATTERN = /\bjobs\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
 
 function discoverWorkflowFiles(workflowsPath) {
   if (!fs.existsSync(workflowsPath)) {
@@ -253,14 +276,85 @@ function evaluateWorkflowFile({
   const lines = source.split(/\r?\n/);
   const findings = [];
   const edits = [];
-  const jobs = collectJobs(lines);
+  const workflowModel = parseWorkflowModel(source);
+  const jobs = buildJobsFromWorkflowModel(workflowModel, lines);
   const upstreamScope = normalizeUpstreamScope({ upstreamRepo, upstreamOwner });
+  const initiallyGatedJobIds = new Set();
+  const outputBlockedJobIds = new Set();
+  const directlyGatedStepIdsByJob = new Map();
 
   for (const job of jobs) {
-    const runsOn = findRunsOnForJob(lines, job);
+    job.relativeFile = relativeFile;
+    job.parsed = job.parsed || workflowModel.jobs.get(job.id) || {
+      id: job.id,
+      line: job.startLine,
+      if: "",
+      ifLine: 0,
+      hasOwnerGuard: false,
+      needs: [],
+      needsLine: 0,
+      snapshot: false,
+      snapshotLine: 0,
+      uses: "",
+      usesLine: 0,
+      secrets: undefined,
+      secretsLine: 0,
+      secretRefs: [],
+      secretNames: [],
+      outputs: [],
+      outputsLine: 0,
+      steps: [],
+      runsOn: null,
+      matrixValues: {},
+      matrixExcludes: [],
+    };
+    job.needs = job.parsed.needs;
+    job.hasOwnerGuard = job.hasOwnerGuard || Boolean(job.parsed.hasOwnerGuard);
+    job.matrixValues = job.matrixValues || job.parsed.matrixValues || {};
+    job.matrixExcludes = job.matrixExcludes || job.parsed.matrixExcludes || [];
+    for (let index = 0; index < job.steps.length; index += 1) {
+      const step = job.steps[index];
+      step.parsed = step.parsed || job.parsed.steps[index] || {
+        id: "",
+        line: step.startLine,
+        if: "",
+        ifLine: 0,
+        hasOwnerGuard: false,
+        uses: "",
+        usesLine: 0,
+        run: "",
+        runLine: 0,
+        env: undefined,
+        envLine: 0,
+        with: undefined,
+        withLine: 0,
+        name: "",
+        nameLine: 0,
+        secretNames: [],
+        secretRefs: [],
+        stepOutputRefs: [],
+        publishTriggerLine: 0,
+      };
+      step.hasOwnerGuard = step.hasOwnerGuard || Boolean(step.parsed.hasOwnerGuard);
+    }
+    if (job.hasOwnerGuard) {
+      initiallyGatedJobIds.add(job.id);
+    }
+    directlyGatedStepIdsByJob.set(
+      job.id,
+      new Set(job.steps.filter((step) => step.hasOwnerGuard && step.parsed.id).map((step) => step.parsed.id))
+    );
+  }
+
+  for (const job of jobs) {
+    const runsOn = job.parsed.runsOn;
     if (runsOn) {
-      const runnerResult = auditRunsOn({ relativeFile, lineNumber: runsOn.startIndex + 1, runsOn, guard: job, upstreamScope, allowList });
+      const runnerLine = runsOn.startLine || (runsOn.startIndex + 1);
+      const runnerResult = auditRunsOn({ relativeFile, lineNumber: runnerLine, runsOn, guard: job, upstreamScope, allowList });
       findings.push(...runnerResult.findings);
+      if (runnerResult.fixKind === "job-guard") {
+        initiallyGatedJobIds.add(job.id);
+      }
       if (mode === "fix" && runnerResult.fixable) {
         edits.push(
           runnerResult.fixKind === "job-guard"
@@ -277,18 +371,129 @@ function evaluateWorkflowFile({
       }
     }
 
+    if (job.parsed.snapshot) {
+      initiallyGatedJobIds.add(job.id);
+      if (!job.hasOwnerGuard) {
+        const jobEdit = makeOwnerGuardEdit({ step: null, job, upstreamScope });
+        findings.push({
+          severity: "warning",
+          file: relativeFile,
+          line: job.parsed.snapshotLine || job.startLine,
+          location: makeKeyLocation(lines, job.parsed.snapshotLine || job.startLine, "snapshot:"),
+          rule: RULES.SNAPSHOT_GATE.slug,
+          ruleCode: RULES.SNAPSHOT_GATE.code,
+          title: RULES.SNAPSHOT_GATE.title,
+          message: `Jobs that define snapshot custom-image generation should usually be skipped on forks with an upstream guard.${formatScopeHint(upstreamScope)}`,
+          fixable: jobEdit != null,
+        });
+        if (mode === "fix" && jobEdit) {
+          edits.push(jobEdit);
+        }
+      }
+    }
+
+    if (job.parsed.uses && !job.hasOwnerGuard) {
+      const inheritedSecrets = job.parsed.secrets === "inherit";
+      const passedSecretNames = job.parsed.secretNames || [];
+      if (inheritedSecrets || passedSecretNames.length > 0) {
+        const jobEdit = makeOwnerGuardEdit({ step: null, job, upstreamScope });
+        const detail = inheritedSecrets
+          ? "This reusable-workflow caller inherits all caller secrets, which are not available on fork pull requests."
+          : `This reusable-workflow caller passes ${passedSecretNames.map((name) => `secrets.${name}`).join(", ")}, which are not available on fork pull requests.`;
+        findings.push({
+          severity: "warning",
+          file: relativeFile,
+          line: job.parsed.secretsLine || job.parsed.usesLine || job.startLine,
+          location:
+            makeSecretLocation(lines, job.parsed.secretRefs || []) ||
+            makeKeyLocation(lines, job.parsed.secretsLine || job.parsed.usesLine || job.startLine, job.parsed.secretsLine ? "secrets:" : "uses:"),
+          rule: RULES.SECRET_GATE.slug,
+          ruleCode: RULES.SECRET_GATE.code,
+          title: RULES.SECRET_GATE.title,
+          message: `${detail}${formatScopeHint(upstreamScope)}`,
+          fixable: jobEdit != null,
+        });
+        initiallyGatedJobIds.add(job.id);
+        if (mode === "fix" && jobEdit) {
+          edits.push(jobEdit);
+        }
+      }
+    }
+
     for (const step of job.steps) {
-      const secretNames = extractSecretNamesInRange(lines, step.startIndex, step.endIndex);
+      const secretNames = step.parsed.secretNames || [];
       if (secretNames.length > 0 && !step.hasOwnerGuard && !job.hasOwnerGuard) {
+        const stepEdit = makeOwnerGuardEdit({ step, job, upstreamScope });
+        const firstSecretRef = step.parsed.secretRefs && step.parsed.secretRefs.length > 0 ? step.parsed.secretRefs[0] : null;
+        findings.push({
+          severity: "warning",
+          file: relativeFile,
+          line: (firstSecretRef && firstSecretRef.line) || step.startLine,
+          location:
+            makeSecretLocation(lines, step.parsed.secretRefs || []) ||
+            makeKeyLocation(lines, (firstSecretRef && firstSecretRef.line) || step.startLine, "secrets."),
+          rule: RULES.SECRET_GATE.slug,
+          ruleCode: RULES.SECRET_GATE.code,
+          title: RULES.SECRET_GATE.title,
+          message: `This step references ${secretNames.map((name) => `secrets.${name}`).join(", ")} without an obvious upstream guard. Fork pull requests cannot access normal repository or organization secrets.${formatScopeHint(upstreamScope)}`,
+          fixable: stepEdit != null,
+        });
+        if (step.parsed.id) {
+          directlyGatedStepIdsByJob.get(job.id)?.add(step.parsed.id);
+        }
+        if (mode === "fix" && stepEdit) {
+          edits.push(stepEdit);
+        }
+      }
+
+      const publishTriggerLine = step.parsed.publishTriggerLine || 0;
+      const publishTrigger = publishTriggerLine > 0 ? { line: publishTriggerLine } : null;
+      if (publishTrigger && !step.hasOwnerGuard && !job.hasOwnerGuard) {
         const stepEdit = makeOwnerGuardEdit({ step, job, upstreamScope });
         findings.push({
           severity: "warning",
           file: relativeFile,
-          line: firstSecretReferenceLine(lines, step.startIndex, step.endIndex),
-          rule: RULES.SECRET_GATE.slug,
-          ruleCode: RULES.SECRET_GATE.code,
-          title: "Secret usage is not owner-gated",
-          message: `This step references ${secretNames.map((name) => `secrets.${name}`).join(", ")} without an obvious upstream guard. Fork pull requests cannot access normal repository or organization secrets.${formatScopeHint(upstreamScope)}`,
+          line: publishTrigger.line,
+          location: makePublishLocation(lines, publishTrigger.line),
+          rule: RULES.PUBLISH_GATE.slug,
+          ruleCode: RULES.PUBLISH_GATE.code,
+          title: RULES.PUBLISH_GATE.title,
+          message: `Publishing, deployment, release-write, and cloud-auth steps should usually be skipped on forks with an upstream guard.${formatScopeHint(upstreamScope)}`,
+          fixable: stepEdit != null,
+        });
+        if (step.parsed.id) {
+          directlyGatedStepIdsByJob.get(job.id)?.add(step.parsed.id);
+        }
+        if (mode === "fix" && stepEdit) {
+          edits.push(stepEdit);
+        }
+      }
+    }
+
+    if (!job.hasOwnerGuard) {
+      const gatedStepIds = directlyGatedStepIdsByJob.get(job.id) || new Set();
+
+      for (const step of job.steps) {
+        if (step.hasOwnerGuard || gatedStepIds.size === 0) {
+          continue;
+        }
+        const referencedGatedSteps = (step.parsed.stepOutputRefs || [])
+          .filter((reference) => gatedStepIds.has(reference.stepId))
+          .map((reference) => reference.stepId);
+        if (referencedGatedSteps.length === 0) {
+          continue;
+        }
+
+        const stepEdit = makeOwnerGuardEdit({ step, job, upstreamScope });
+        findings.push({
+          severity: "warning",
+          file: relativeFile,
+          line: step.parsed.stepOutputRefs[0].line || step.startLine,
+          location: makeOutputReferenceLocation(lines, step.parsed.stepOutputRefs[0]),
+          rule: RULES.OUTPUT_GATE.slug,
+          ruleCode: RULES.OUTPUT_GATE.code,
+          title: RULES.OUTPUT_GATE.title,
+          message: `This step reads outputs from ${[...new Set(referencedGatedSteps)].join(", ")}, which ${referencedGatedSteps.length === 1 ? "is" : "are"} upstream-only or skipped on forks. Output consumers should also be skipped on forks.${formatScopeHint(upstreamScope)}`,
           fixable: stepEdit != null,
         });
         if (mode === "fix" && stepEdit) {
@@ -296,24 +501,75 @@ function evaluateWorkflowFile({
         }
       }
 
-      const publishTrigger = detectPublishTriggerInStep(lines, step);
-      if (publishTrigger && !step.hasOwnerGuard && !job.hasOwnerGuard) {
-        const stepEdit = makeOwnerGuardEdit({ step, job, upstreamScope });
+      for (const output of job.parsed.outputs || []) {
+        const referencedGatedSteps = (output.stepOutputRefs || [])
+          .filter((reference) => gatedStepIds.has(reference.stepId))
+          .map((reference) => reference.stepId);
+        if (referencedGatedSteps.length === 0) {
+          continue;
+        }
+
+        const jobEdit = makeOwnerGuardEdit({ step: null, job, upstreamScope });
         findings.push({
           severity: "warning",
           file: relativeFile,
-          line: publishTrigger.line,
-          rule: RULES.PUBLISH_GATE.slug,
-          ruleCode: RULES.PUBLISH_GATE.code,
-          title: RULES.PUBLISH_GATE.title,
-          message: `Publishing, deployment, release-write, and cloud-auth steps should usually be skipped on forks with an upstream guard.${formatScopeHint(upstreamScope)}`,
-          fixable: stepEdit != null,
+          line: output.line || job.parsed.outputsLine || job.startLine,
+          location:
+            makeOutputReferenceLocation(lines, output.stepOutputRefs[0]) ||
+            makeKeyLocation(lines, output.line || job.parsed.outputsLine || job.startLine, `${output.name}:`),
+          rule: RULES.OUTPUT_GATE.slug,
+          ruleCode: RULES.OUTPUT_GATE.code,
+          title: RULES.OUTPUT_GATE.title,
+          message: `Job output ${output.name} depends on ${[...new Set(referencedGatedSteps)].join(", ")}, which ${referencedGatedSteps.length === 1 ? "is" : "are"} upstream-only or skipped on forks. Jobs exporting those outputs should also be skipped on forks.${formatScopeHint(upstreamScope)}`,
+          fixable: jobEdit != null,
         });
-        if (mode === "fix" && stepEdit) {
-          edits.push(stepEdit);
+        outputBlockedJobIds.add(job.id);
+        if (mode === "fix" && jobEdit) {
+          edits.push(jobEdit);
         }
       }
     }
+  }
+
+  for (const jobId of outputBlockedJobIds) {
+    initiallyGatedJobIds.add(jobId);
+  }
+
+  const reverseNeeds = buildReverseNeedsGraph(jobs);
+  const propagatedNeeds = collectNeedsPropagationFindings({
+    jobs,
+    reverseNeeds,
+    initiallyGatedJobIds,
+    upstreamScope,
+    lines,
+  });
+  findings.push(...propagatedNeeds.findings);
+  if (mode === "fix") {
+    edits.push(...propagatedNeeds.edits);
+  }
+
+  const allGatedJobIds = propagatedNeeds.gatedJobIds || new Set(initiallyGatedJobIds);
+  for (const workflowOutput of workflowModel.workflowOutputs || []) {
+    const referencedGatedJobs = (workflowOutput.jobOutputRefs || [])
+      .filter((reference) => allGatedJobIds.has(reference.jobId))
+      .map((reference) => reference.jobId);
+    if (referencedGatedJobs.length === 0) {
+      continue;
+    }
+
+    findings.push({
+      severity: "warning",
+      file: relativeFile,
+      line: workflowOutput.line || 1,
+      location:
+        makeJobOutputReferenceLocation(lines, workflowOutput.jobOutputRefs[0]) ||
+        makeKeyLocation(lines, workflowOutput.line || 1, `${workflowOutput.name}:`),
+      rule: RULES.OUTPUT_GATE.slug,
+      ruleCode: RULES.OUTPUT_GATE.code,
+      title: RULES.OUTPUT_GATE.title,
+      message: `Reusable workflow output ${workflowOutput.name} depends on ${[...new Set(referencedGatedJobs)].join(", ")}, which ${referencedGatedJobs.length === 1 ? "is" : "are"} upstream-only or skipped on forks. Workflow outputs should not depend on producers that only run upstream.${formatScopeHint(upstreamScope)}`,
+      fixable: false,
+    });
   }
 
   const normalizedEdits = dedupeEdits(edits).filter(Boolean);
@@ -330,627 +586,653 @@ function evaluateWorkflowFile({
   };
 }
 
-function collectJobs(lines) {
-  const jobs = [];
-  let inJobs = false;
-  let jobsIndent = 0;
-  let currentJob = null;
+function buildJobsFromWorkflowModel(workflowModel, lines) {
+  if (!workflowModel || !(workflowModel.jobs instanceof Map) || workflowModel.jobs.size === 0) {
+    return [];
+  }
 
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (isCommentOnly(line) || line.trim() === "") {
-      continue;
-    }
-
-    const indent = countIndent(line);
-    const trimmed = line.trim();
-
-    if (/^jobs:\s*$/.test(trimmed)) {
-      inJobs = true;
-      jobsIndent = indent;
-      continue;
-    }
-
-    if (!inJobs) {
-      continue;
-    }
-
-    if (indent <= jobsIndent && /^[A-Za-z0-9_-]+:\s*/.test(trimmed)) {
-      currentJob = null;
-      inJobs = false;
-      continue;
-    }
-
-    if (indent === jobsIndent + 2 && /^[A-Za-z0-9_-]+:\s*(#.*)?$/.test(trimmed)) {
-      currentJob = {
-        startIndex: index,
-        startLine: index + 1,
-        endLine: lines.length,
-        endIndex: lines.length - 1,
-        bodyIndent: jobsIndent + 4,
-        hasOwnerGuard: false,
-        matrixValues: {},
-        matrixExcludes: [],
-        steps: [],
+  const parsedJobs = [...workflowModel.jobs.values()].sort((left, right) => left.line - right.line);
+  return parsedJobs.map((parsedJob, index) => {
+    const startLine = parsedJob.line || 1;
+    const startIndex = Math.max(startLine - 1, 0);
+    const parsedEndLine = parsedJob.endLine || startLine;
+    const endIndex = Math.max(Math.min(parsedEndLine - 1, lines.length - 1), startIndex);
+    const bodyIndent = countIndent(lines[startIndex] || "") + 2;
+    const steps = (parsedJob.steps || []).map((parsedStep) => {
+      const stepStartLine = parsedStep.line || startLine;
+      const stepStartIndex = Math.max(stepStartLine - 1, 0);
+      const stepEndIndex = Math.max(Math.min((parsedStep.endLine || stepStartLine) - 1, endIndex), stepStartIndex);
+      return {
+        startIndex: stepStartIndex,
+        startLine: stepStartLine,
+        endIndex: stepEndIndex,
+        endLine: stepEndIndex + 1,
+        indent: countIndent(lines[stepStartIndex] || ""),
+        hasOwnerGuard: Boolean(parsedStep.hasOwnerGuard),
+        parsed: parsedStep,
       };
-      jobs.push(currentJob);
-      if (jobs.length > 1) {
-        jobs[jobs.length - 2].endLine = index;
-        jobs[jobs.length - 2].endIndex = index - 1;
-      }
-      continue;
-    }
+    });
 
-    if (currentJob && indent === currentJob.bodyIndent && /^if:\s*/.test(trimmed) && OWNER_GUARD_PATTERNS.some((pattern) => pattern.test(trimmed))) {
-      currentJob.hasOwnerGuard = true;
-    }
-  }
-
-  for (const job of jobs) {
-    job.matrixValues = collectMatrixValues(lines, job);
-    job.matrixExcludes = collectMatrixExcludes(lines, job);
-    job.steps = collectSteps(lines, job);
-  }
-
-  return jobs;
+    return {
+      id: parsedJob.id,
+      startIndex,
+      startLine,
+      endIndex,
+      endLine: endIndex + 1,
+      bodyIndent,
+      hasOwnerGuard: Boolean(parsedJob.hasOwnerGuard),
+      matrixValues: parsedJob.matrixValues || {},
+      matrixExcludes: parsedJob.matrixExcludes || [],
+      steps,
+      parsed: parsedJob,
+    };
+  });
 }
 
-function collectSteps(lines, job) {
-  const steps = [];
-  let inSteps = false;
-  let stepsIndent = -1;
-  let currentStep = null;
+function parseWorkflowModel(source) {
+  const lineCounter = new YAML.LineCounter();
+  let document;
+  try {
+    document = YAML.parseDocument(source, {
+      lineCounter,
+      merge: true,
+      uniqueKeys: false,
+    });
+  } catch {
+    return { jobs: new Map(), workflowOutputs: [] };
+  }
 
-  for (let index = job.startIndex + 1; index <= job.endIndex; index += 1) {
-    const line = lines[index];
-    if (line.trim() === "" || isCommentOnly(line)) {
-      continue;
-    }
+  if (document.errors && document.errors.length > 0) {
+    return { jobs: new Map(), workflowOutputs: [] };
+  }
 
-    const indent = countIndent(line);
-    const trimmed = line.trim();
+  const jobsNode = document.get("jobs", true);
+  const jobs = new Map();
+  const workflowOutputs = parseWorkflowCallOutputs(document, lineCounter);
 
-    if (!inSteps) {
-      if (indent === job.bodyIndent && /^steps:\s*$/.test(trimmed)) {
-        inSteps = true;
-        stepsIndent = indent;
+  if (jobsNode && typeof jobsNode === "object" && Array.isArray(jobsNode.items)) {
+    for (const jobPair of jobsNode.items) {
+      const jobId = yamlNodeToString(jobPair.key);
+      if (!jobId || !jobPair.value || !Array.isArray(jobPair.value.items)) {
+        continue;
       }
-      continue;
-    }
 
-    if (indent <= stepsIndent) {
-      if (currentStep) {
-        currentStep.endIndex = index - 1;
-        currentStep.endLine = index;
-      }
-      break;
-    }
+      const needsPair = getYamlMapPair(jobPair.value, "needs");
+      const snapshotPair = getYamlMapPair(jobPair.value, "snapshot");
+      const usesPair = getYamlMapPair(jobPair.value, "uses");
+      const secretsPair = getYamlMapPair(jobPair.value, "secrets");
+      const ifPair = getYamlMapPair(jobPair.value, "if");
+      const outputsPair = getYamlMapPair(jobPair.value, "outputs");
+      const stepsPair = getYamlMapPair(jobPair.value, "steps");
+      const runsOnPair = getYamlMapPair(jobPair.value, "runs-on");
+      const strategyPair = getYamlMapPair(jobPair.value, "strategy");
 
-    const stepMatch = line.match(/^(\s*)-\s+(name|uses|run):/);
-    if (stepMatch) {
-      if (currentStep) {
-        currentStep.endIndex = index - 1;
-        currentStep.endLine = index;
-      }
-      currentStep = {
-        startIndex: index,
-        startLine: index + 1,
-        endIndex: job.endIndex,
-        endLine: job.endLine,
-        indent: stepMatch[1].length,
-        hasOwnerGuard: false,
-      };
-      steps.push(currentStep);
-      continue;
-    }
+      const ifValue = yamlNodeToString(ifPair && ifPair.value);
+      const usesValue = yamlNodeToString(usesPair && usesPair.value);
+      const secretsValue = yamlNodeToJSON(secretsPair && secretsPair.value);
+      const outputs = parseJobOutputs(outputsPair && outputsPair.value, lineCounter);
+      const steps = parseJobSteps(stepsPair && stepsPair.value, lineCounter);
+      const runsOn = parseRunsOnNode(runsOnPair, lineCounter, source);
+      const matrix = parseMatrixConfig(strategyPair && strategyPair.value);
 
-    if (currentStep && indent === currentStep.indent + 2 && /^if:\s*/.test(trimmed) && OWNER_GUARD_PATTERNS.some((pattern) => pattern.test(trimmed))) {
-      currentStep.hasOwnerGuard = true;
+      jobs.set(jobId, {
+        id: jobId,
+        line: yamlNodeLine(lineCounter, jobPair.key),
+        endLine: yamlNodeEndLine(lineCounter, jobPair.value) || yamlNodeLine(lineCounter, jobPair.key),
+        needs: normalizeNeedsNode(needsPair && needsPair.value),
+        needsLine: yamlNodeLine(lineCounter, needsPair && needsPair.key),
+        snapshot: Boolean(snapshotPair),
+        snapshotLine: yamlNodeLine(lineCounter, snapshotPair && snapshotPair.key),
+        if: ifValue,
+        ifLine: yamlNodeLine(lineCounter, ifPair && ifPair.key),
+        hasOwnerGuard: containsOwnerGuard(ifValue),
+        uses: usesValue,
+        usesLine: yamlNodeLine(lineCounter, usesPair && usesPair.key),
+        secrets: secretsValue,
+        secretsLine: yamlNodeLine(lineCounter, secretsPair && secretsPair.key),
+        secretRefs: extractSecretReferencesFromValue(secretsValue, yamlNodeLine(lineCounter, secretsPair && secretsPair.key)),
+        secretNames: extractSecretNamesFromValue(secretsValue),
+        outputs,
+        outputsLine: yamlNodeLine(lineCounter, outputsPair && outputsPair.key),
+        steps,
+        runsOn,
+        matrixValues: matrix.values,
+        matrixExcludes: matrix.excludes,
+      });
     }
   }
 
-  if (currentStep) {
-    currentStep.endIndex = Math.min(currentStep.endIndex, job.endIndex);
-    currentStep.endLine = currentStep.endIndex + 1;
-  }
-
-  return steps;
+  return { jobs, workflowOutputs };
 }
 
-function findRunsOnForJob(lines, job) {
-  for (let index = job.startIndex + 1; index <= job.endIndex; index += 1) {
-    const line = lines[index];
-    if (line.trim() === "" || isCommentOnly(line)) {
-      continue;
-    }
-    if (countIndent(line) !== job.bodyIndent) {
-      continue;
-    }
-    const runsOn = parseRunsOn(lines, index);
-    if (runsOn) {
-      return runsOn;
-    }
+function parseWorkflowCallOutputs(document, lineCounter) {
+  const outputsNode = document.getIn(["on", "workflow_call", "outputs"], true);
+  if (!outputsNode || !Array.isArray(outputsNode.items)) {
+    return [];
   }
-  return null;
+
+  const outputs = [];
+  for (const outputPair of outputsNode.items) {
+    const valuePair = getYamlMapPair(outputPair.value, "value");
+    const value = yamlNodeToString(valuePair && valuePair.value);
+    outputs.push({
+      name: yamlNodeToString(outputPair.key),
+      line: yamlNodeLine(lineCounter, (valuePair && valuePair.key) || outputPair.key),
+      value,
+      jobOutputRefs: extractJobOutputReferencesFromValue(value, yamlNodeLine(lineCounter, (valuePair && valuePair.key) || outputPair.key)),
+    });
+  }
+
+  return outputs;
 }
 
-function parseRunsOn(lines, index) {
-  const line = lines[index];
-  const match = line.match(/^(\s*)runs-on:\s*(.*)$/);
-  if (!match) {
+function parseJobOutputs(outputsNode, lineCounter) {
+  if (!outputsNode || !Array.isArray(outputsNode.items)) {
+    return [];
+  }
+
+  return outputsNode.items.map((outputPair) => {
+    const line = yamlNodeLine(lineCounter, outputPair.key);
+    const value = yamlNodeToString(outputPair.value);
+    return {
+      name: yamlNodeToString(outputPair.key),
+      line,
+      value,
+      stepOutputRefs: extractStepOutputReferencesFromValue(value, line),
+    };
+  });
+}
+
+function parseJobSteps(stepsNode, lineCounter) {
+  if (!stepsNode || !Array.isArray(stepsNode.items)) {
+    return [];
+  }
+
+  return stepsNode.items.map((stepNode) => {
+    const idPair = getYamlMapPair(stepNode, "id");
+    const ifPair = getYamlMapPair(stepNode, "if");
+    const usesPair = getYamlMapPair(stepNode, "uses");
+    const runPair = getYamlMapPair(stepNode, "run");
+    const envPair = getYamlMapPair(stepNode, "env");
+    const withPair = getYamlMapPair(stepNode, "with");
+    const namePair = getYamlMapPair(stepNode, "name");
+
+    const ifValue = yamlNodeToString(ifPair && ifPair.value);
+    const runValue = yamlNodeToString(runPair && runPair.value);
+    const usesValue = yamlNodeToString(usesPair && usesPair.value);
+    const envValue = yamlNodeToJSON(envPair && envPair.value);
+    const withValue = yamlNodeToJSON(withPair && withPair.value);
+    const nameValue = yamlNodeToString(namePair && namePair.value);
+    const stepLine = yamlNodeLine(lineCounter, stepNode);
+    const secretRefs = [
+      ...extractSecretReferencesFromValue(ifValue, yamlNodeLine(lineCounter, ifPair && ifPair.key)),
+      ...extractSecretReferencesFromValue(runValue, yamlNodeLine(lineCounter, runPair && runPair.key)),
+      ...extractSecretReferencesFromValue(envValue, yamlNodeLine(lineCounter, envPair && envPair.key)),
+      ...extractSecretReferencesFromValue(withValue, yamlNodeLine(lineCounter, withPair && withPair.key)),
+      ...extractSecretReferencesFromValue(nameValue, yamlNodeLine(lineCounter, namePair && namePair.key)),
+    ];
+
+    return {
+      id: yamlNodeToString(idPair && idPair.value),
+      line: stepLine,
+      endLine: yamlNodeEndLine(lineCounter, stepNode) || stepLine,
+      if: ifValue,
+      ifLine: yamlNodeLine(lineCounter, ifPair && ifPair.key),
+      hasOwnerGuard: containsOwnerGuard(ifValue),
+      uses: usesValue,
+      usesLine: yamlNodeLine(lineCounter, usesPair && usesPair.key),
+      run: runValue,
+      runLine: yamlNodeLine(lineCounter, runPair && runPair.key),
+      env: envValue,
+      envLine: yamlNodeLine(lineCounter, envPair && envPair.key),
+      with: withValue,
+      withLine: yamlNodeLine(lineCounter, withPair && withPair.key),
+      name: nameValue,
+      nameLine: yamlNodeLine(lineCounter, namePair && namePair.key),
+      secretNames: [...new Set(secretRefs.map((ref) => ref.name))],
+      secretRefs,
+      stepOutputRefs: [
+        ...extractStepOutputReferencesFromValue(ifValue, yamlNodeLine(lineCounter, ifPair && ifPair.key)),
+        ...extractStepOutputReferencesFromValue(runValue, yamlNodeLine(lineCounter, runPair && runPair.key)),
+        ...extractStepOutputReferencesFromValue(envValue, yamlNodeLine(lineCounter, envPair && envPair.key)),
+        ...extractStepOutputReferencesFromValue(withValue, yamlNodeLine(lineCounter, withPair && withPair.key)),
+      ],
+      publishTriggerLine: detectPublishTriggerInParsedStep({
+        uses: usesValue,
+        usesLine: yamlNodeLine(lineCounter, usesPair && usesPair.key),
+        run: runValue,
+        runLine: yamlNodeLine(lineCounter, runPair && runPair.key),
+      }),
+    };
+  });
+}
+
+function parseRunsOnNode(runsOnPair, lineCounter, source) {
+  if (!runsOnPair || !runsOnPair.value) {
     return null;
   }
 
-  const indent = match[1].length;
-  const rest = stripInlineComment(match[2]).trim();
-  if (rest !== "") {
-    const inlineMap = parseInlineRunsOnMap(rest);
-    if (inlineMap) {
-      return {
-        startIndex: index,
-        endIndex: index,
-        indent,
-        raw: rest,
-        labels: inlineMap.labels,
-        group: inlineMap.group,
-        usesGroup: Boolean(inlineMap.group),
-        isExpression: inlineMap.isExpression,
-        inline: true,
-      };
-    }
+  const value = yamlNodeToJSON(runsOnPair.value);
+  const keyPosition = yamlNodePosition(lineCounter, runsOnPair.key);
+  const startLine = keyPosition.line;
+  const endLine = yamlNodeEndLine(lineCounter, runsOnPair.value) || startLine;
+  const location = makeLocation(startLine, keyPosition.column || 1, "runs-on".length);
+
+  if (typeof value === "string") {
     return {
-      startIndex: index,
-      endIndex: index,
-      indent,
-      raw: rest,
-      labels: parseRunnerLabels(rest),
+      startLine,
+      endLine,
+      location,
+      raw: value,
+      labels: parseRunnerLabels(value),
       group: "",
       usesGroup: false,
-      isExpression: rest.includes("${{"),
-      inline: true,
+      isExpression: value.includes("${{"),
+      inline: startLine === endLine,
+      text: yamlNodeText(source, runsOnPair.value),
     };
   }
 
-  const labels = [];
-  let group = "";
-  let usesGroup = false;
-  let labelsIndent = -1;
-  let endIndex = index;
-  for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
-    const nextLine = lines[cursor];
-    if (nextLine.trim() === "" || isCommentOnly(nextLine)) {
-      continue;
-    }
-    if (countIndent(nextLine) <= indent) {
-      break;
-    }
-    endIndex = cursor;
-
-    const childIndent = countIndent(nextLine);
-    const trimmed = nextLine.trim();
-    if (labelsIndent !== -1 && childIndent > labelsIndent) {
-      const labelItemMatch = trimmed.match(/^-\s*(.+)$/);
-      if (labelItemMatch) {
-        labels.push(cleanYamlScalar(labelItemMatch[1]));
-        continue;
-      }
-    } else if (labelsIndent !== -1 && childIndent <= labelsIndent) {
-      labelsIndent = -1;
-    }
-
-    const itemMatch = trimmed.match(/^-\s*(.+)$/);
-    if (itemMatch) {
-      labels.push(cleanYamlScalar(itemMatch[1]));
-      continue;
-    }
-
-    const keyMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
-    if (!keyMatch) {
-      continue;
-    }
-
-    const key = keyMatch[1];
-    const value = stripInlineComment(keyMatch[2]).trim();
-    if (key === "group") {
-      usesGroup = true;
-      group = cleanYamlScalar(value);
-      continue;
-    }
-    if (key === "labels") {
-      if (value) {
-        labels.push(...parseRunnerLabels(value));
-      } else {
-        labelsIndent = childIndent;
-      }
-    }
+  if (Array.isArray(value)) {
+    const labels = value.map((entry) => String(entry).trim()).filter(Boolean);
+    return {
+      startLine,
+      endLine,
+      location,
+      raw: yamlNodeText(source, runsOnPair.value).trim(),
+      labels,
+      group: "",
+      usesGroup: false,
+      isExpression: labels.some((label) => label.includes("${{")),
+      inline: false,
+      text: yamlNodeText(source, runsOnPair.value),
+    };
   }
 
-  return {
-    startIndex: index,
-    endIndex,
-    indent,
-    raw: group ? `group: ${group}${labels.length > 0 ? `, labels: ${labels.join(", ")}` : ""}` : labels.join(", "),
-    labels,
-    group,
-    usesGroup,
-    isExpression: labels.some((label) => label.includes("${{")),
-    inline: false,
-  };
+  if (value && typeof value === "object") {
+    const group = typeof value.group === "string" ? value.group.trim() : "";
+    const labels = Array.isArray(value.labels)
+      ? value.labels.map((entry) => String(entry).trim()).filter(Boolean)
+      : typeof value.labels === "string"
+        ? parseRunnerLabels(value.labels)
+        : [];
+    return {
+      startLine,
+      endLine,
+      location,
+      raw: yamlNodeText(source, runsOnPair.value).trim(),
+      labels,
+      group,
+      usesGroup: Boolean(group),
+      isExpression: group.includes("${{") || labels.some((label) => label.includes("${{")),
+      inline: startLine === endLine,
+      text: yamlNodeText(source, runsOnPair.value),
+    };
+  }
+
+  return null;
 }
 
-function parseInlineRunsOnMap(value) {
-  const trimmed = String(value).trim();
-  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
-    return null;
+function parseMatrixConfig(strategyNode) {
+  const empty = { values: {}, excludes: [] };
+  if (!strategyNode) {
+    return empty;
   }
 
-  const content = trimmed.slice(1, -1).trim();
-  const fields = content
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean);
-
-  let group = "";
-  const labels = [];
-  for (const field of fields) {
-    const match = field.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.+)$/);
-    if (!match) {
-      return null;
-    }
-    const key = match[1];
-    const fieldValue = match[2];
-    if (key === "group") {
-      group = cleanYamlScalar(fieldValue);
-      continue;
-    }
-    if (key === "labels") {
-      labels.push(...parseRunnerLabels(fieldValue));
-      continue;
-    }
-    return null;
+  const strategy = yamlNodeToJSON(strategyNode);
+  const matrix = strategy && typeof strategy === "object" ? strategy.matrix : undefined;
+  if (!matrix || typeof matrix !== "object" || Array.isArray(matrix)) {
+    return empty;
   }
 
-  return {
-    group,
-    labels,
-    isExpression: labels.some((label) => label.includes("${{")) || group.includes("${{"),
-  };
-}
-
-function collectMatrixValues(lines, job) {
   const values = new Map();
-  let strategyIndent = -1;
-  let matrixIndent = -1;
-  let includeIndent = -1;
-  let activeKey = "";
-  let pendingObjectKey = "";
-  let pendingObjectIndent = -1;
-  let pendingObject = null;
-  let activeListObjectKey = "";
-  let activeListObjectIndent = -1;
-  let activeListObject = null;
-  let activeListNestedKey = "";
-  let activeListNestedIndent = -1;
-  let activeListNestedObject = null;
-
-  function flushPendingObject() {
-    if (pendingObject) {
-      addMatrixValue(values, pendingObjectKey, pendingObject);
-      pendingObjectKey = "";
-      pendingObjectIndent = -1;
-      pendingObject = null;
+  for (const [key, rawValue] of Object.entries(matrix)) {
+    if (key === "exclude" || key === "include") {
+      continue;
     }
+    if (Array.isArray(rawValue)) {
+      for (const entry of rawValue) {
+        addMatrixValue(values, key, entry);
+      }
+      continue;
+    }
+    addMatrixValue(values, key, rawValue);
   }
 
-  function flushActiveListObject() {
-    if (activeListObject) {
-      if (activeListNestedObject) {
-        activeListObject[activeListNestedKey] = activeListNestedObject;
-      }
-      addMatrixValue(values, activeListObjectKey, activeListObject);
-      activeListObjectKey = "";
-      activeListObjectIndent = -1;
-      activeListObject = null;
-      activeListNestedKey = "";
-      activeListNestedIndent = -1;
-      activeListNestedObject = null;
-    }
-  }
-
-  for (let index = job.startIndex + 1; index <= job.endIndex; index += 1) {
-    const line = lines[index];
-    if (!line || line.trim() === "" || isCommentOnly(line)) {
-      continue;
-    }
-
-    const indent = countIndent(line);
-    const trimmed = line.trim();
-
-    if (pendingObject && indent <= pendingObjectIndent) {
-      flushPendingObject();
-    }
-    if (activeListObject && indent <= activeListObjectIndent) {
-      flushActiveListObject();
-    }
-
-    if (indent === job.bodyIndent && /^strategy:\s*$/.test(trimmed)) {
-      strategyIndent = indent;
-      matrixIndent = -1;
-      includeIndent = -1;
-      activeKey = "";
-      continue;
-    }
-
-    if (strategyIndent !== -1 && indent <= strategyIndent) {
-      flushPendingObject();
-      flushActiveListObject();
-      strategyIndent = -1;
-      matrixIndent = -1;
-      includeIndent = -1;
-      activeKey = "";
-    }
-
-    if (strategyIndent === -1) {
-      continue;
-    }
-
-    if (indent === strategyIndent + 2 && /^matrix:\s*$/.test(trimmed)) {
-      matrixIndent = indent;
-      includeIndent = -1;
-      activeKey = "";
-      continue;
-    }
-
-    if (matrixIndent !== -1 && indent <= matrixIndent) {
-      flushPendingObject();
-      flushActiveListObject();
-      matrixIndent = -1;
-      includeIndent = -1;
-      activeKey = "";
-    }
-
-    if (matrixIndent === -1) {
-      continue;
-    }
-
-    if (indent === matrixIndent + 2) {
-      activeKey = "";
-      const keyMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
-      if (!keyMatch) {
+  if (Array.isArray(matrix.include)) {
+    for (const includeEntry of matrix.include) {
+      if (!includeEntry || typeof includeEntry !== "object" || Array.isArray(includeEntry)) {
         continue;
       }
-
-      const key = keyMatch[1];
-      const remainder = stripInlineComment(keyMatch[2]).trim();
-      if (key === "include") {
-        includeIndent = indent;
-        continue;
-      }
-
-      includeIndent = -1;
-      activeKey = key;
-      if (remainder) {
-        for (const value of parseMatrixValuesInline(remainder)) {
-          addMatrixValue(values, key, value);
-        }
-      } else if (includeIndent !== -1 || key === "runs_on") {
-        pendingObjectKey = key;
-        pendingObjectIndent = indent;
-        pendingObject = {};
-      }
-      continue;
-    }
-
-    if (pendingObject && indent > pendingObjectIndent) {
-      const nestedMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.+)$/);
-      if (nestedMatch) {
-        pendingObject[nestedMatch[1]] = parseYamlValue(nestedMatch[2]);
-        continue;
-      }
-    }
-
-    if (activeKey && indent > matrixIndent + 2) {
-      if (activeListObject) {
-        if (activeListNestedObject && indent <= activeListNestedIndent) {
-          activeListObject[activeListNestedKey] = activeListNestedObject;
-          activeListNestedKey = "";
-          activeListNestedIndent = -1;
-          activeListNestedObject = null;
-        }
-
-        if (activeListNestedObject && indent > activeListNestedIndent) {
-          const nestedMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.+)$/);
-          if (nestedMatch) {
-            activeListNestedObject[nestedMatch[1]] = parseYamlValue(nestedMatch[2]);
-            continue;
-          }
-        }
-
-        if (indent > activeListObjectIndent) {
-          const propertyMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
-          if (propertyMatch) {
-            const propertyKey = propertyMatch[1];
-            const propertyValue = stripInlineComment(propertyMatch[2]).trim();
-            if (propertyValue) {
-              activeListObject[propertyKey] = parseYamlValue(propertyValue);
-            } else {
-              activeListNestedKey = propertyKey;
-              activeListNestedIndent = indent;
-              activeListNestedObject = {};
-            }
-            continue;
-          }
-        }
-      }
-
-      const listItemMatch = trimmed.match(/^-\s+(.+)$/);
-      if (listItemMatch) {
-        const objectItemMatch = trimmed.match(/^- ([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
-        if (objectItemMatch) {
-          flushActiveListObject();
-          activeListObjectKey = activeKey;
-          activeListObjectIndent = indent;
-          activeListObject = {};
-          const propertyKey = objectItemMatch[1];
-          const propertyValue = stripInlineComment(objectItemMatch[2]).trim();
-          if (propertyValue) {
-            activeListObject[propertyKey] = parseYamlValue(propertyValue);
-          } else {
-            activeListNestedKey = propertyKey;
-            activeListNestedIndent = indent;
-            activeListNestedObject = {};
-          }
-        } else {
-          flushActiveListObject();
-          addMatrixValue(values, activeKey, parseYamlValue(listItemMatch[1]));
-        }
-        continue;
-      }
-    }
-
-    if (includeIndent !== -1 && indent > includeIndent) {
-      const includeValueMatch = trimmed.match(/^(?:-\s+)?([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
-      if (includeValueMatch) {
-        const includeValue = stripInlineComment(includeValueMatch[2]).trim();
-        if (includeValue) {
-          for (const value of parseMatrixValuesInline(includeValue)) {
-            addMatrixValue(values, includeValueMatch[1], value);
-          }
-        } else {
-          flushPendingObject();
-          pendingObjectKey = includeValueMatch[1];
-          pendingObjectIndent = indent;
-          pendingObject = {};
-        }
+      for (const [key, rawValue] of Object.entries(includeEntry)) {
+        addMatrixValue(values, key, rawValue);
       }
     }
   }
 
-  flushPendingObject();
-  flushActiveListObject();
+  const excludes = Array.isArray(matrix.exclude)
+    ? matrix.exclude
+        .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+        .map((entry) => normalizeMatrixObject(entry))
+        .filter((entry) => Object.keys(entry).length > 0)
+    : [];
 
-  return Object.fromEntries(values);
+  return {
+    values: Object.fromEntries(values),
+    excludes,
+  };
 }
 
-function collectMatrixExcludes(lines, job) {
-  const excludes = [];
-  let strategyIndent = -1;
-  let matrixIndent = -1;
-  let excludeIndent = -1;
-  let currentExclude = null;
-  let stack = [];
+function getYamlMapPair(node, key) {
+  if (!node || !Array.isArray(node.items)) {
+    return null;
+  }
+  return node.items.find((item) => yamlNodeToString(item.key) === key) || null;
+}
 
-  function flushCurrentExclude() {
-    if (currentExclude && Object.keys(currentExclude).length > 0) {
-      excludes.push(normalizeMatrixObject(currentExclude));
-    }
-    currentExclude = null;
-    stack = [];
+function yamlNodeToString(node) {
+  if (!node) {
+    return "";
+  }
+  const value = typeof node.toJSON === "function" ? node.toJSON() : node;
+  return typeof value === "string" ? value : "";
+}
+
+function yamlNodeToJSON(node) {
+  if (!node || typeof node.toJSON !== "function") {
+    return undefined;
+  }
+  return node.toJSON();
+}
+
+function yamlNodeLine(lineCounter, node) {
+  if (!node || !Array.isArray(node.range) || typeof node.range[0] !== "number") {
+    return 0;
+  }
+  const position = lineCounter.linePos(node.range[0]);
+  return position && typeof position.line === "number" ? position.line : 0;
+}
+
+function yamlNodePosition(lineCounter, node) {
+  if (!node || !Array.isArray(node.range) || typeof node.range[0] !== "number") {
+    return { line: 0, column: 0 };
+  }
+  const position = lineCounter.linePos(node.range[0]);
+  return {
+    line: position && typeof position.line === "number" ? position.line : 0,
+    column: position && typeof position.col === "number" ? position.col : 0,
+  };
+}
+
+function yamlNodeEndLine(lineCounter, node) {
+  if (!node || !Array.isArray(node.range) || typeof node.range[1] !== "number") {
+    return 0;
+  }
+  const offset = Math.max(node.range[1] - 1, node.range[0]);
+  const position = lineCounter.linePos(offset);
+  return position && typeof position.line === "number" ? position.line : 0;
+}
+
+function yamlNodeText(source, node) {
+  if (!node || !Array.isArray(node.range) || typeof node.range[0] !== "number" || typeof node.range[1] !== "number") {
+    return "";
+  }
+  return String(source).slice(node.range[0], node.range[1]);
+}
+
+function normalizeNeedsNode(node) {
+  if (!node) {
+    return [];
   }
 
-  for (let index = job.startIndex + 1; index <= job.endIndex; index += 1) {
-    const line = lines[index];
-    if (!line || line.trim() === "" || isCommentOnly(line)) {
-      continue;
-    }
+  const value = yamlNodeToJSON(node);
+  if (typeof value === "string" && value) {
+    return [value];
+  }
+  if (Array.isArray(value)) {
+    return value.filter((entry) => typeof entry === "string" && entry);
+  }
+  return [];
+}
 
-    const indent = countIndent(line);
-    const trimmed = line.trim();
+function containsOwnerGuard(value) {
+  return OWNER_GUARD_PATTERNS.some((pattern) => pattern.test(String(value || "")));
+}
 
-    if (indent === job.bodyIndent && /^strategy:\s*$/.test(trimmed)) {
-      strategyIndent = indent;
-      matrixIndent = -1;
-      excludeIndent = -1;
-      flushCurrentExclude();
-      continue;
-    }
+function collectStringValues(value) {
+  if (typeof value === "string") {
+    return [value];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => collectStringValues(entry));
+  }
+  if (value && typeof value === "object") {
+    return Object.values(value).flatMap((entry) => collectStringValues(entry));
+  }
+  return [];
+}
 
-    if (strategyIndent !== -1 && indent <= strategyIndent) {
-      flushCurrentExclude();
-      strategyIndent = -1;
-      matrixIndent = -1;
-      excludeIndent = -1;
-    }
+function extractReferencesFromValue(value, line, pattern, mapMatch) {
+  const refs = [];
+  const seen = new Set();
 
-    if (strategyIndent === -1) {
-      continue;
-    }
-
-    if (indent === strategyIndent + 2 && /^matrix:\s*$/.test(trimmed)) {
-      matrixIndent = indent;
-      excludeIndent = -1;
-      flushCurrentExclude();
-      continue;
-    }
-
-    if (matrixIndent !== -1 && indent <= matrixIndent) {
-      flushCurrentExclude();
-      matrixIndent = -1;
-      excludeIndent = -1;
-    }
-
-    if (matrixIndent === -1) {
-      continue;
-    }
-
-    if (indent === matrixIndent + 2 && /^exclude:\s*$/.test(trimmed)) {
-      excludeIndent = indent;
-      flushCurrentExclude();
-      continue;
-    }
-
-    if (excludeIndent !== -1 && indent <= excludeIndent) {
-      flushCurrentExclude();
-      excludeIndent = -1;
-    }
-
-    if (excludeIndent === -1) {
-      continue;
-    }
-
-    const listItemMatch = trimmed.match(/^- ([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
-    if (listItemMatch) {
-      flushCurrentExclude();
-      currentExclude = {};
-      stack = [{ indent, container: currentExclude }];
-
-      const propertyKey = listItemMatch[1];
-      const propertyValue = stripInlineComment(listItemMatch[2]).trim();
-      if (propertyValue) {
-        currentExclude[propertyKey] = parseYamlValue(propertyValue);
-      } else {
-        currentExclude[propertyKey] = {};
-        stack.push({ indent: indent + 2, container: currentExclude[propertyKey] });
+  for (const text of collectStringValues(value)) {
+    const regex = new RegExp(pattern.source, pattern.flags);
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      const ref = mapMatch(match, line);
+      const key = JSON.stringify(ref);
+      if (!seen.has(key)) {
+        seen.add(key);
+        refs.push(ref);
       }
-      continue;
-    }
-
-    if (!currentExclude) {
-      continue;
-    }
-
-    while (stack.length > 0 && indent <= stack[stack.length - 1].indent) {
-      stack.pop();
-    }
-
-    const target = stack.length > 0 ? stack[stack.length - 1].container : currentExclude;
-    const propertyMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/);
-    if (!propertyMatch) {
-      continue;
-    }
-
-    const propertyKey = propertyMatch[1];
-    const propertyValue = stripInlineComment(propertyMatch[2]).trim();
-    if (propertyValue) {
-      target[propertyKey] = parseYamlValue(propertyValue);
-    } else {
-      target[propertyKey] = {};
-      stack.push({ indent, container: target[propertyKey] });
     }
   }
 
-  flushCurrentExclude();
-  return excludes;
+  return refs;
+}
+
+function extractStepOutputReferencesFromValue(value, line = 0) {
+  return extractReferencesFromValue(value, line, STEP_OUTPUT_REFERENCE_PATTERN, (match, refLine) => ({
+    stepId: match[1],
+    outputName: match[2],
+    line: refLine,
+  }));
+}
+
+function extractJobOutputReferencesFromValue(value, line = 0) {
+  return extractReferencesFromValue(value, line, JOB_OUTPUT_REFERENCE_PATTERN, (match, refLine) => ({
+    jobId: match[1],
+    outputName: match[2],
+    line: refLine,
+  }));
+}
+
+function extractNeedsOutputReferencesFromValue(value, line = 0) {
+  return extractReferencesFromValue(value, line, NEEDS_OUTPUT_REFERENCE_PATTERN, (match, refLine) => ({
+    jobId: match[1],
+    outputName: match[2],
+    line: refLine,
+  }));
+}
+
+function extractSecretNamesFromValue(value) {
+  const names = new Set();
+  for (const text of collectStringValues(value)) {
+    for (const name of extractSecretNames(text)) {
+      names.add(name);
+    }
+  }
+  return [...names];
+}
+
+function extractSecretReferencesFromValue(value, line = 0) {
+  const refs = [];
+  const seen = new Set();
+  for (const text of collectStringValues(value)) {
+    for (const name of extractSecretNames(text)) {
+      const key = `${name}:${line}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      refs.push({ name, line });
+    }
+  }
+  return refs;
+}
+
+function detectPublishTriggerInParsedStep({ uses = "", usesLine = 0, run = "", runLine = 0 }) {
+  if (uses && PUBLISH_USES_PATTERNS.some((pattern) => pattern.test(uses))) {
+    return usesLine;
+  }
+  if (run && PUBLISH_RUN_PATTERNS.some((pattern) => pattern.test(run))) {
+    return runLine;
+  }
+  return 0;
+}
+
+function makeLocation(line, column, length = 1) {
+  return {
+    line: Math.max(line || 1, 1),
+    column: Math.max(column || 1, 1),
+    length: Math.max(length || 1, 1),
+  };
+}
+
+function findPatternLocation(lineText, line, pattern, fallbackColumn = 1, fallbackLength = 1) {
+  const text = String(lineText || "");
+  const regex = pattern instanceof RegExp ? new RegExp(pattern.source, pattern.flags) : null;
+  const match = regex ? text.match(regex) : null;
+  if (match && match.index != null) {
+    return makeLocation(line, match.index + 1, match[0].length);
+  }
+  return makeLocation(line, fallbackColumn, fallbackLength);
+}
+
+function makeKeyLocation(lines, line, keyText) {
+  const lineText = lines[Math.max((line || 1) - 1, 0)] || "";
+  const index = lineText.indexOf(keyText);
+  return makeLocation(line, index === -1 ? firstVisibleColumn(lineText) : index + 1, keyText.replace(/:$/, "").length || 1);
+}
+
+function runsOnLocation(runsOn, line) {
+  if (runsOn && runsOn.location) {
+    return runsOn.location;
+  }
+  return makeLocation(line, 1, "runs-on".length);
+}
+
+function makeSecretLocation(lines, refs) {
+  const reference = Array.isArray(refs) ? refs[0] : null;
+  if (!reference) {
+    return null;
+  }
+  return findPatternLocation(
+    lines[Math.max(reference.line - 1, 0)] || "",
+    reference.line,
+    new RegExp(`secrets\\.${reference.name}\\b`),
+    1,
+    `secrets.${reference.name}`.length
+  );
+}
+
+function makePublishLocation(lines, line) {
+  return findPatternLocation(
+    lines[Math.max(line - 1, 0)] || "",
+    line,
+    /\b(npm\s+publish|twine\s+upload|docker\s+push|gh\s+release\s+(create|upload|edit|delete)|uses:|run:)\b/i
+  );
+}
+
+function makeOutputReferenceLocation(lines, reference) {
+  if (!reference) {
+    return null;
+  }
+  return findPatternLocation(
+    lines[Math.max(reference.line - 1, 0)] || "",
+    reference.line,
+    new RegExp(`steps\\.${reference.stepId}\\.outputs\\.${reference.outputName}\\b`),
+    1,
+    `steps.${reference.stepId}.outputs.${reference.outputName}`.length
+  );
+}
+
+function makeJobOutputReferenceLocation(lines, reference) {
+  if (!reference) {
+    return null;
+  }
+  return findPatternLocation(
+    lines[Math.max(reference.line - 1, 0)] || "",
+    reference.line,
+    new RegExp(`jobs\\.${reference.jobId}\\.outputs\\.${reference.outputName}\\b`),
+    1,
+    `jobs.${reference.jobId}.outputs.${reference.outputName}`.length
+  );
+}
+
+function buildReverseNeedsGraph(jobs) {
+  const reverseNeeds = new Map();
+  for (const job of jobs) {
+    for (const need of job.needs || []) {
+      if (!reverseNeeds.has(need)) {
+        reverseNeeds.set(need, new Set());
+      }
+      reverseNeeds.get(need).add(job.id);
+    }
+  }
+  return reverseNeeds;
+}
+
+function collectNeedsPropagationFindings({ jobs, reverseNeeds, initiallyGatedJobIds, upstreamScope, lines }) {
+  const visited = new Set(initiallyGatedJobIds);
+  const queue = [...initiallyGatedJobIds];
+  const findings = [];
+  const edits = [];
+
+  while (queue.length > 0) {
+    const gatedJobId = queue.shift();
+    const dependents = reverseNeeds.get(gatedJobId);
+    if (!dependents) {
+      continue;
+    }
+
+    for (const dependentId of dependents) {
+      if (visited.has(dependentId)) {
+        continue;
+      }
+      visited.add(dependentId);
+      queue.push(dependentId);
+
+      const job = jobs.find((entry) => entry.id === dependentId);
+      if (!job) {
+        continue;
+      }
+
+      if (job.hasOwnerGuard) {
+        continue;
+      }
+
+      const gatedNeeds = (job.needs || []).filter((need) => visited.has(need));
+      const jobEdit = makeOwnerGuardEdit({ step: null, job, upstreamScope });
+      findings.push({
+        severity: "warning",
+        file: job.relativeFile,
+        line: job.parsed.needsLine || job.startLine,
+        location: makeKeyLocation(lines || [], job.parsed.needsLine || job.startLine, "needs:"),
+        rule: RULES.NEEDS_GATE.slug,
+        ruleCode: RULES.NEEDS_GATE.code,
+        title: RULES.NEEDS_GATE.title,
+        message: `This job depends on ${gatedNeeds.join(", ")}, which ${gatedNeeds.length === 1 ? "is" : "are"} upstream-only or skipped on forks. Dependent jobs should also be skipped on forks.${formatScopeHint(upstreamScope)}`,
+        fixable: jobEdit != null,
+      });
+      if (jobEdit) {
+        edits.push(jobEdit);
+      }
+    }
+  }
+
+  return { findings, edits, gatedJobIds: visited };
 }
 
 function addMatrixValue(values, key, value) {
@@ -1013,23 +1295,8 @@ function normalizeMatrixObject(value) {
   );
 }
 
-function parseMatrixValuesInline(value) {
-  const trimmed = String(value).trim();
-  if (!trimmed) {
-    return [];
-  }
-  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-    return trimmed
-      .slice(1, -1)
-      .split(",")
-      .map((item) => cleanYamlScalar(item))
-      .filter(Boolean);
-  }
-  return [cleanYamlScalar(trimmed)].filter(Boolean);
-}
-
 function parseRunnerLabels(value) {
-  const trimmed = value.trim();
+  const trimmed = String(value).trim();
   if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
     return trimmed
       .slice(1, -1)
@@ -1041,6 +1308,7 @@ function parseRunnerLabels(value) {
 }
 
 function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamScope, allowList }) {
+  const location = runsOnLocation(runsOn, lineNumber);
   if (runsOn.usesGroup) {
     if (guard?.hasOwnerGuard) {
       return { fixable: false, findings: [] };
@@ -1053,6 +1321,7 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamScope, a
           severity: "error",
           file: relativeFile,
           line: lineNumber,
+          location,
           rule: RULES.RUNNER_LABEL.slug,
           ruleCode: RULES.RUNNER_LABEL.code,
           title: "Private runner is not fork-friendly",
@@ -1085,6 +1354,7 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamScope, a
             severity: "warning",
             file: relativeFile,
             line: lineNumber,
+            location,
             rule: RULES.RUNNER_EXPRESSION.slug,
             ruleCode: RULES.RUNNER_EXPRESSION.code,
             title: "Dynamic runner expression needs a fork fallback",
@@ -1104,6 +1374,7 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamScope, a
             severity: "warning",
             file: relativeFile,
             line: lineNumber,
+            location,
             rule: RULES.RUNNER_EXPRESSION.slug,
             ruleCode: RULES.RUNNER_EXPRESSION.code,
             title: "Dynamic runner expression needs a fork fallback",
@@ -1133,6 +1404,7 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamScope, a
         severity: "error",
         file: relativeFile,
         line: lineNumber,
+        location,
         rule: RULES.RUNNER_LABEL.slug,
         ruleCode: RULES.RUNNER_LABEL.code,
         title: "Private runner is not fork-friendly",
@@ -1146,6 +1418,12 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamScope, a
 }
 
 function makeRunsOnEdit({ lines, runsOn, upstreamScope, runnerFallback, preferredFallback = "", fallbackExpression = "" }) {
+  const startIndex = typeof runsOn.startIndex === "number" ? runsOn.startIndex : Math.max((runsOn.startLine || 1) - 1, 0);
+  const endIndexInclusive = typeof runsOn.endIndex === "number" ? runsOn.endIndex : Math.max((runsOn.endLine || runsOn.startLine || 1) - 1, startIndex);
+  const indent =
+    typeof runsOn.indent === "number"
+      ? runsOn.indent
+      : countIndent(lines[startIndex] || "");
   const originalRunner = runsOn.isExpression
     ? `(${stripExpressionDelimiters(runsOn.raw)})`
     : runnerExpressionValue(runsOn.labels);
@@ -1157,11 +1435,11 @@ function makeRunsOnEdit({ lines, runsOn, upstreamScope, runnerFallback, preferre
     );
   const expression = `\${{ ${upstreamScope.guardExpression} && ${originalRunner} || ${fallbackRunner} }}`;
   return {
-    start: runsOn.startIndex,
-    end: runsOn.endIndex + 1,
-    replacement: [`${" ".repeat(runsOn.indent)}runs-on: ${expression}`],
+    start: startIndex,
+    end: endIndexInclusive + 1,
+    replacement: [`${" ".repeat(indent)}runs-on: ${expression}`],
     title: "Add fork runner fallback",
-    key: `replace:${runsOn.startIndex}:${runsOn.endIndex}:runs-on`,
+    key: `replace:${startIndex}:${endIndexInclusive}:runs-on`,
   };
 }
 
@@ -1477,50 +1755,6 @@ function makeOwnerGuardEdit({ step, job, upstreamScope }) {
   return null;
 }
 
-function detectPublishTriggerInStep(lines, step) {
-  for (let index = step.startIndex; index <= step.endIndex; index += 1) {
-    const line = lines[index];
-    if (!line || line.trim() === "" || isCommentOnly(line)) {
-      continue;
-    }
-
-    const trimmed = line.trim();
-    const usesMatch = trimmed.match(/^(?:-\s+)?uses:\s*(.+)$/);
-    if (usesMatch && PUBLISH_USES_PATTERNS.some((pattern) => pattern.test(usesMatch[1]))) {
-      return { index, line: index + 1 };
-    }
-
-    const runMatch = trimmed.match(/^(?:-\s+)?run:\s*(.*)$/);
-    if (!runMatch) {
-      continue;
-    }
-
-    const remainder = runMatch[1].trim();
-    if (remainder && remainder !== "|" && remainder !== ">") {
-      if (PUBLISH_RUN_PATTERNS.some((pattern) => pattern.test(remainder))) {
-        return { index, line: index + 1 };
-      }
-      continue;
-    }
-
-    const runIndent = countIndent(line);
-    for (let cursor = index + 1; cursor <= step.endIndex; cursor += 1) {
-      const scriptLine = lines[cursor];
-      if (!scriptLine || scriptLine.trim() === "" || isCommentOnly(scriptLine)) {
-        continue;
-      }
-      if (countIndent(scriptLine) <= runIndent) {
-        break;
-      }
-      if (PUBLISH_RUN_PATTERNS.some((pattern) => pattern.test(scriptLine.trim()))) {
-        return { index: cursor, line: cursor + 1 };
-      }
-    }
-  }
-
-  return null;
-}
-
 function applyEdits(lines, edits) {
   const fixed = [...lines];
   for (const edit of [...edits].sort((left, right) => right.start - left.start)) {
@@ -1536,32 +1770,18 @@ function isPublicRunner(label, allowList) {
   return PUBLIC_GITHUB_HOSTED_RUNNERS.has(label);
 }
 
-function extractSecretNamesInRange(lines, startIndex, endIndex) {
-  const names = new Set();
-  for (let index = startIndex; index <= endIndex; index += 1) {
-    for (const name of extractSecretNames(lines[index] || "")) {
-      names.add(name);
-    }
-  }
-  return [...names];
-}
-
-function firstSecretReferenceLine(lines, startIndex, endIndex) {
-  for (let index = startIndex; index <= endIndex; index += 1) {
-    if (extractSecretNames(lines[index] || "").length > 0) {
-      return index + 1;
-    }
-  }
-  return startIndex + 1;
-}
-
 function extractSecretNames(line) {
   const names = [];
-  const pattern = /\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
-  let match;
-  while ((match = pattern.exec(line)) !== null) {
-    if (match[1] !== "GITHUB_TOKEN") {
-      names.push(match[1]);
+  const expressionPattern = /\$\{\{([\s\S]*?)\}\}/g;
+  let expressionMatch;
+  while ((expressionMatch = expressionPattern.exec(String(line))) !== null) {
+    const expression = expressionMatch[1];
+    const secretPattern = /(?:^|[^A-Za-z0-9_])secrets\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
+    let secretMatch;
+    while ((secretMatch = secretPattern.exec(expression)) !== null) {
+      if (secretMatch[1] !== "GITHUB_TOKEN") {
+        names.push(secretMatch[1]);
+      }
     }
   }
   return [...new Set(names)];
@@ -1571,14 +1791,6 @@ function cleanYamlScalar(value) {
   return stripInlineComment(value)
     .trim()
     .replace(/^["']|["']$/g, "");
-}
-
-function parseYamlValue(value) {
-  const normalized = normalizeYamlValue(value);
-  if (Array.isArray(normalized)) {
-    return normalized;
-  }
-  return String(normalized);
 }
 
 function normalizeYamlValue(value) {
@@ -1598,8 +1810,9 @@ function normalizeYamlValue(value) {
 }
 
 function stripInlineComment(value) {
-  const hashIndex = value.indexOf("#");
-  return hashIndex === -1 ? value : value.slice(0, hashIndex);
+  const text = String(value);
+  const hashIndex = text.indexOf("#");
+  return hashIndex === -1 ? text : text.slice(0, hashIndex);
 }
 
 function countIndent(line) {

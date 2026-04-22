@@ -339,12 +339,27 @@ function describeEntry(entry, rule, fileLines) {
   }
 
   if (rule.code === RULES.SECRET_GATE.code) {
+    if (entry.findings.some((finding) => /inherits all caller secrets/.test(finding.message))) {
+      return "secrets: inherit";
+    }
     const secretNames = [...new Set(entry.findings.flatMap((finding) => extractSecretNamesFromMessage(finding.message)))];
     return `secret${secretNames.length === 1 ? "" : "s"}: ${secretNames.join(", ")}`;
   }
 
   if (rule.code === RULES.PUBLISH_GATE.code) {
     return "publish, deploy, or auth trigger";
+  }
+
+  if (rule.code === RULES.SNAPSHOT_GATE.code) {
+    return "snapshot custom-image job";
+  }
+
+  if (rule.code === RULES.NEEDS_GATE.code) {
+    return "depends on upstream-only job";
+  }
+
+  if (rule.code === RULES.OUTPUT_GATE.code) {
+    return "depends on gated output producer";
   }
 
   return entry.findings[0].title || "workflow finding";
@@ -362,8 +377,7 @@ function extractSecretNamesFromMessage(message) {
 }
 
 function printEntry(entry, { fileLines, maxLineDigits, command }) {
-  const firstLineText = fileLines[entry.startLine - 1] || "";
-  const firstHighlight = inferHighlight(firstLineText, entry.findings[0]);
+  const firstHighlight = resolveHighlight(fileLines, entry.findings[0]);
   const location = `${entry.file}:${entry.startLine}:${firstHighlight.column}`;
 
   console.log(`${paint("yellow", "  -")} ${paint("yellow", location)} ${paint("gray", `(${entry.note})`)}`);
@@ -395,20 +409,42 @@ function printSnippet(fileLines, entry, maxLineDigits) {
   const highlightsByLine = new Map();
 
   for (const finding of entry.findings) {
-    const lineText = fileLines[finding.line - 1] || "";
-    highlightsByLine.set(finding.line, inferHighlight(lineText, finding));
+    const highlight = resolveHighlight(fileLines, finding);
+    if (!highlightsByLine.has(highlight.line)) {
+      highlightsByLine.set(highlight.line, []);
+    }
+    highlightsByLine.get(highlight.line).push(highlight);
   }
 
   console.log(`${paint("gray", `    ${gutter} |`)}`);
   for (let currentLine = startLine; currentLine <= endLine; currentLine += 1) {
     console.log(`${paint("gray", `    ${String(currentLine).padStart(maxLineDigits)} |`)} ${fileLines[currentLine - 1] || ""}`);
     if (highlightsByLine.has(currentLine)) {
-      const highlight = highlightsByLine.get(currentLine);
-      console.log(
-        `${paint("gray", `    ${gutter} |`)} ${" ".repeat(Math.max(highlight.column - 1, 0))}${paint("cyan", "^".repeat(Math.max(highlight.length, 1)))}`
-      );
+      for (const highlight of highlightsByLine.get(currentLine)) {
+        console.log(
+          `${paint("gray", `    ${gutter} |`)} ${" ".repeat(Math.max(highlight.column - 1, 0))}${paint("cyan", "^".repeat(Math.max(highlight.length, 1)))}`
+        );
+      }
     }
   }
+}
+
+function resolveHighlight(fileLines, finding) {
+  if (finding.location && typeof finding.location.line === "number") {
+    return {
+      line: finding.location.line,
+      column: Math.max(finding.location.column || 1, 1),
+      length: Math.max(finding.location.length || 1, 1),
+    };
+  }
+
+  const lineText = fileLines[finding.line - 1] || "";
+  const highlight = inferHighlight(lineText, finding);
+  return {
+    line: finding.line,
+    column: highlight.column,
+    length: highlight.length,
+  };
 }
 
 function inferHighlight(lineText, finding) {
@@ -423,6 +459,9 @@ function inferHighlight(lineText, finding) {
     "runner-expression": /runs-on:/,
     "secret-gate": /secrets\.[A-Za-z_][A-Za-z0-9_]*/,
     "publish-gate": /\b(npm\s+publish|twine\s+upload|docker\s+push|gh\s+release\s+(create|upload|edit|delete)|uses:)\b/i,
+    "snapshot-gate": /snapshot:/,
+    "needs-gate": /needs:/,
+    "output-gate": /(?:outputs:|steps\.[A-Za-z_][A-Za-z0-9_-]*\.outputs|jobs\.[A-Za-z_][A-Za-z0-9_-]*\.outputs)/,
   };
 
   const pattern = markerPatterns[finding.rule];

@@ -47,6 +47,7 @@ jobs:
   assert.equal(findings[0].severity, "error");
   assert.equal(findings[0].ruleCode, RULES.RUNNER_LABEL.code);
   assert.equal(findings[0].rule, RULES.RUNNER_LABEL.slug);
+  assert.deepEqual(findings[0].location, { line: 6, column: 5, length: 7 });
   assert.match(findings[0].message, /benchmark/);
 });
 
@@ -119,6 +120,82 @@ jobs:
 `);
 
   assert.deepEqual(findings, []);
+});
+
+test("flags snapshot jobs without an owner guard", () => {
+  const findings = audit(`
+name: CI
+on: pull_request
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    snapshot:
+      image-name: custom-runner
+    steps:
+      - run: echo build
+`);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.SNAPSHOT_GATE.code);
+  assert.equal(findings[0].line, 7);
+});
+
+test("propagates upstream-only gating through needs dependencies", () => {
+  const findings = audit(`
+name: CI
+on: pull_request
+jobs:
+  image:
+    runs-on: [self-hosted, linux]
+    steps:
+      - run: echo build
+  test:
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+`);
+
+  assert.equal(findings.length, 2);
+  assert.equal(findings[0].ruleCode, RULES.RUNNER_LABEL.code);
+  assert.equal(findings[1].ruleCode, RULES.NEEDS_GATE.code);
+  assert.equal(findings[1].line, 10);
+});
+
+test("flags reusable workflow caller secrets while allowing GITHUB_TOKEN", () => {
+  const findings = audit(`
+name: Reuse
+on: pull_request
+jobs:
+  unsafe:
+    uses: owner/repo/.github/workflows/reusable.yml@v1
+    secrets:
+      access-token: \${{ secrets.PERSONAL_ACCESS_TOKEN }}
+  safe:
+    uses: owner/repo/.github/workflows/reusable.yml@v1
+    secrets:
+      token: \${{ secrets.GITHUB_TOKEN }}
+`);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.SECRET_GATE.code);
+  assert.match(findings[0].message, /reusable-workflow caller passes secrets\.PERSONAL_ACCESS_TOKEN/);
+  assert.equal(findings[0].location.line, 7);
+});
+
+test("flags inherited reusable workflow secrets", () => {
+  const findings = audit(`
+name: Reuse
+on: pull_request
+jobs:
+  unsafe:
+    uses: owner/repo/.github/workflows/reusable.yml@v1
+    secrets: inherit
+`);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.SECRET_GATE.code);
+  assert.match(findings[0].message, /inherits all caller secrets/);
 });
 
 test("allows dynamic runners on owner-gated jobs", () => {
@@ -206,6 +283,22 @@ jobs:
     runs-on:
       group: ubuntu-runners
       labels: ubuntu-24.04-16core
+    steps:
+      - run: npm test
+`);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.RUNNER_LABEL.code);
+  assert.match(findings[0].message, /Runner group ubuntu-runners requires private runner access/);
+});
+
+test("flags inline runs-on objects with private runner groups", () => {
+  const findings = audit(`
+name: CI
+on: pull_request
+jobs:
+  gated:
+    runs-on: { group: ubuntu-runners, labels: [ubuntu-24.04-16core] }
     steps:
       - run: npm test
 `);
@@ -389,6 +482,52 @@ jobs:
   assert.deepEqual(findings, []);
 });
 
+test("flags step output consumers when the producer is upstream-gated", () => {
+  const findings = audit(`
+name: Build
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - id: auth
+        if: github.repository == 'ExampleOrg/example-repo'
+        run: echo "token=abc" >> "$GITHUB_OUTPUT"
+      - name: Use token
+        run: echo "\${{ steps.auth.outputs.token }}"
+`);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.OUTPUT_GATE.code);
+  assert.match(findings[0].message, /reads outputs from auth/);
+  assert.equal(findings[0].location.line, 12);
+});
+
+test("flags reusable workflow outputs that depend on upstream-only jobs", () => {
+  const findings = audit(`
+name: Reusable
+on:
+  workflow_call:
+    outputs:
+      token:
+        value: \${{ jobs.build.outputs.token }}
+jobs:
+  build:
+    if: github.repository == 'ExampleOrg/example-repo'
+    runs-on: ubuntu-latest
+    outputs:
+      token: \${{ steps.auth.outputs.token }}
+    steps:
+      - id: auth
+        run: echo "token=abc" >> "$GITHUB_OUTPUT"
+`);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.OUTPUT_GATE.code);
+  assert.match(findings[0].message, /Reusable workflow output token depends on build/);
+  assert.equal(findings[0].fixable, false);
+});
+
 test("flags release write commands and cloud auth actions", () => {
   const findings = auditWorkflowFile({
     filePath: "/repo/.github/workflows/release.yml",
@@ -520,6 +659,79 @@ jobs:
 
   assert.match(result.fixedSource, /- run: twine upload dist\/\*\n        if: github\.repository == 'ExampleOrg\/example-repo'\n        env:/);
   assert.equal(result.changes.length, 1);
+});
+
+test("fixes snapshot jobs with a job-level upstream guard", () => {
+  const result = fixWorkflowFile({
+    filePath: "/repo/.github/workflows/image.yml",
+    source: `
+name: Image
+on: pull_request
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    snapshot:
+      image-name: custom-runner
+    steps:
+      - run: echo build
+`,
+    cwd: "/repo",
+    upstreamRepo: "ExampleOrg/example-repo",
+  });
+
+  assert.match(result.fixedSource, /image:\n    if: github\.repository == 'ExampleOrg\/example-repo'\n    runs-on: ubuntu-latest/);
+  assert.equal(result.changes.length, 1);
+});
+
+test("fixes dependent jobs when an upstream-only prerequisite is skipped on forks", () => {
+  const result = fixWorkflowFile({
+    filePath: "/repo/.github/workflows/ci.yml",
+    source: `
+name: CI
+on: pull_request
+jobs:
+  image:
+    runs-on: [self-hosted, linux]
+    steps:
+      - run: echo build
+  test:
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+`,
+    cwd: "/repo",
+    upstreamRepo: "ExampleOrg/example-repo",
+  });
+
+  assert.match(result.fixedSource, /image:\n    if: github\.repository == 'ExampleOrg\/example-repo'\n    runs-on: \[self-hosted, linux\]/);
+  assert.match(result.fixedSource, /test:\n    if: github\.repository == 'ExampleOrg\/example-repo'\n    needs: image/);
+  assert.equal(result.changes.length, 2);
+});
+
+test("fixes job outputs that depend on upstream-only step outputs with a job guard", () => {
+  const result = fixWorkflowFile({
+    filePath: "/repo/.github/workflows/reusable.yml",
+    source: `
+name: Reusable
+on:
+  workflow_call:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      token: \${{ steps.auth.outputs.token }}
+    steps:
+      - id: auth
+        if: github.repository == 'ExampleOrg/example-repo'
+        run: echo "token=abc" >> "$GITHUB_OUTPUT"
+`,
+    cwd: "/repo",
+    upstreamRepo: "ExampleOrg/example-repo",
+  });
+
+  assert.match(result.fixedSource, /build:\n    if: github\.repository == 'ExampleOrg\/example-repo'\n    runs-on: ubuntu-latest/);
+  assert.equal(result.findings[0].ruleCode, RULES.OUTPUT_GATE.code);
 });
 
 test("fixes block-style self-hosted runner arrays with an owner-gated job skip", () => {
@@ -808,7 +1020,7 @@ test("parses --fix and --check command aliases", () => {
 test("rule codes use stable FFxxx identifiers", () => {
   assert.deepEqual(
     Object.values(RULES).map((rule) => rule.code),
-    ["FF001", "FF002", "FF003", "FF004"]
+    ["FF001", "FF002", "FF003", "FF004", "FF005", "FF006", "FF007"]
   );
 });
 
@@ -840,6 +1052,33 @@ jobs:
   assert.match(result.stdout, /5 \|     runs-on: benchmark/);
   assert.match(result.stdout, /6 \|     steps:/);
   assert.equal(fs.readFileSync(workflowPath, "utf8"), original);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("CLI labels inherited reusable workflow secrets as secrets: inherit", () => {
+  const tmpDir = fs.mkdtempSync(path.join(process.cwd(), "tmp-ffactions-inherit-"));
+  const workflowsDir = path.join(tmpDir, ".github", "workflows");
+  fs.mkdirSync(workflowsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(workflowsDir, "reuse.yml"),
+    `name: Reuse
+on: pull_request
+jobs:
+  unsafe:
+    uses: owner/repo/.github/workflows/reusable.yml@v1
+    secrets: inherit
+`
+  );
+
+  const result = childProcess.spawnSync(process.execPath, ["bin/fork-friendly-actions.js", "--cwd", tmpDir, "--upstream-owner", "ExampleOrg"], {
+    cwd: path.resolve(__dirname, ".."),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /FF003 secret-gate: Secret usage is not owner-gated/);
+  assert.match(result.stdout, /- \.github\/workflows\/reuse\.yml:6:5 \(secrets: inherit\)/);
+  assert.match(result.stdout, /6 \|     secrets: inherit/);
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
