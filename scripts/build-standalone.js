@@ -8,12 +8,17 @@ const path = require("node:path");
 const repoRoot = path.resolve(__dirname, "..");
 const corePath = path.join(repoRoot, "src", "index.js");
 const cliPath = path.join(repoRoot, "bin", "fork-friendly-actions.js");
+const dataPath = path.join(repoRoot, "data", "public-github-hosted-runners.txt");
 const outputDir = path.join(repoRoot, "dist");
 const outputPath = path.join(outputDir, "ffactions");
 
 function stripCoreModule(source) {
   return source
     .replace(/^"use strict";\n\n/, "")
+    .replace(
+      /^const EMBEDDED_PUBLIC_GITHUB_HOSTED_RUNNERS = null;\n/m,
+      `const EMBEDDED_PUBLIC_GITHUB_HOSTED_RUNNERS = ${JSON.stringify(loadPublicRunners())};\n`
+    )
     .replace(/\nmodule\.exports = \{[\s\S]*?\n\};\n?$/, "");
 }
 
@@ -21,13 +26,22 @@ function stripCliModule(source) {
   return source
     .replace(/^#!\/usr\/bin\/env node\n\n/, "")
     .replace(/^"use strict";\n\n/, "")
+    .replace(/^const fs = require\("node:fs"\);\n/m, "")
     .replace(/^const path = require\("node:path"\);\n/m, "")
     .replace(
-      /^const \{\n  DEFAULT_RUNNER_FALLBACK,\n  DEFAULT_WORKFLOWS_DIR,\n  auditWorkflows,\n  fixWorkflows,\n  shouldFail,\n\} = require\("\.\.\/src\/index\.js"\);\n\n/m,
+      /^const \{[\s\S]*?\} = require\("\.\.\/src\/index\.js"\);\n\n/m,
       ""
     )
     .replace(/fork-friendly-actions/g, "ffactions")
     .replace(/\nmodule\.exports = \{[\s\S]*?\n\};\n?$/, "");
+}
+
+function loadPublicRunners() {
+  return fs
+    .readFileSync(dataPath, "utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 const coreSource = stripCoreModule(fs.readFileSync(corePath, "utf8"));

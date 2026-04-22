@@ -6,8 +6,12 @@ inputs:
     description: Directory containing workflow files to audit.
     required: false
     default: .github/workflows
+  upstream-repo:
+    description: Repository slug allowed to use private runners, secrets, and publish jobs. Defaults to the current repository.
+    required: false
+    default: ""
   upstream-owner:
-    description: Repository owner that is allowed to use private runners, secrets, and publish jobs. Defaults to the current repository owner.
+    description: Repository owner that is allowed to use private runners, secrets, and publish jobs. Used as a fallback when upstream-repo is not set.
     required: false
     default: ""
   fail-on:

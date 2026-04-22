@@ -8,12 +8,17 @@ their fork, and get useful feedback before asking maintainers to run upstream CI
 This action checks workflow files for common blockers:
 
 - private or self-hosted runner labels without a public fallback
+- runner groups that require private runner access
 - dynamic `runs-on` expressions that do not clearly fall back on forks
 - repository or organization secrets used without an owner gate
 - publish, release, deployment, or cloud-auth steps used without an owner gate
 
 The CLI is intentionally conservative. It rewrites mechanical cases and leaves
 ambiguous workflow logic as manual findings.
+
+The set of public GitHub-hosted runner labels is committed in
+`data/public-github-hosted-runners.txt`. Runtime checks use that file instead of
+regex heuristics so the behavior is deterministic and reviewable.
 
 ## CLI Usage
 
@@ -23,12 +28,15 @@ Run this from a project checkout:
 npx fork-friendly-actions
 ```
 
-By default, the CLI runs `fix`, evaluates `.github/workflows`, detects the
-upstream owner from `remote.origin.url`, and writes changes for fixable issues.
-You can also pass `--fix` explicitly:
+By default, the CLI runs `check`, evaluates `.github/workflows`, and reports
+findings without changing files. For fork workflows, it prefers the `upstream`
+git remote and falls back to `origin` to determine the upstream repository
+scope. That repo slug is the default source of truth for gating and fixes.
+
+To apply fixable changes, run `fix` explicitly:
 
 ```sh
-npx fork-friendly-actions --fix
+npx fork-friendly-actions fix
 ```
 
 To create one standalone file that can live anywhere on your `PATH`:
@@ -56,7 +64,14 @@ Only evaluate workflows:
 npx fork-friendly-actions check
 ```
 
-Pass the owner explicitly when the checkout has no GitHub `origin` remote:
+Pass the full upstream repository explicitly when the checkout has no usable git
+remotes or when you want to override detection:
+
+```sh
+npx fork-friendly-actions fix --upstream-repo ExampleOrg/example-repo
+```
+
+Pass only the owner when no repo slug is available:
 
 ```sh
 npx fork-friendly-actions fix --upstream-owner ExampleOrg
@@ -66,6 +81,12 @@ Use a different public fallback runner:
 
 ```sh
 npx fork-friendly-actions fix --runner-fallback ubuntu-22.04-arm
+```
+
+Refresh the committed public-runner list from GitHub Docs:
+
+```sh
+npm run update:public-runners
 ```
 
 ## What It Changes
@@ -79,11 +100,11 @@ runs-on: benchmark
 becomes:
 
 ```yaml
-runs-on: ${{ github.repository_owner == 'ExampleOrg' && 'benchmark' || 'ubuntu-latest' }}
+runs-on: ${{ github.repository == 'ExampleOrg/example-repo' && 'benchmark' || 'ubuntu-latest' }}
 ```
 
-Private runner arrays are preserved for upstream and get an array fallback for
-forks:
+Self-hosted runner arrays are treated as upstream-only and get a job guard
+instead of a fork fallback:
 
 ```yaml
 runs-on:
@@ -95,7 +116,29 @@ runs-on:
 becomes:
 
 ```yaml
-runs-on: ${{ github.repository_owner == 'ExampleOrg' && fromJSON('["self-hosted","Linux","ARM64"]') || fromJSON('["ubuntu-latest"]') }}
+if: github.repository == 'ExampleOrg/example-repo'
+runs-on:
+  - self-hosted
+  - Linux
+  - ARM64
+```
+
+Runner groups are treated as upstream-only and get a job guard instead of a
+fork fallback:
+
+```yaml
+runs-on:
+  group: ubuntu-runners
+  labels: ubuntu-24.04-16core
+```
+
+becomes:
+
+```yaml
+if: github.repository == 'ExampleOrg/example-repo'
+runs-on:
+  group: ubuntu-runners
+  labels: ubuntu-24.04-16core
 ```
 
 Publish, deploy, cloud-auth, release, and secret-backed steps get a step-level
@@ -111,7 +154,7 @@ becomes:
 
 ```yaml
 - run: twine upload dist/*
-  if: github.repository_owner == 'ExampleOrg'
+  if: github.repository == 'ExampleOrg/example-repo'
   env:
     TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 ```
@@ -203,7 +246,8 @@ steps:
 | `mode` | `check` | Use `check` to report findings or `fix` to rewrite files. |
 | `fail-on` | dynamic | Minimum severity that fails the action. Defaults to `error` in `check` mode and `none` in `fix` mode. |
 | `allow-runners` | empty | Comma-separated runner labels to treat as fork-friendly. |
-| `upstream-owner` | current repository owner | Owner name used in guard suggestions. |
+| `upstream-repo` | detected from `git remote get-url upstream`, then `origin` | Repository slug used for strict fork gating and fix suggestions. |
+| `upstream-owner` | derived from `upstream-repo` when possible | Owner name used as a fallback when `upstream-repo` is not set. |
 | `runner-fallback` | `ubuntu-latest` | Public runner used when adding fork fallbacks. |
 
 ## Outputs
@@ -225,3 +269,23 @@ a release and selecting "Publish this Action to the GitHub Marketplace". See
 
 This repository intentionally does not include `.github/workflows` so it remains
 eligible for Marketplace listing.
+
+## Maintaining The Public Runner List
+
+`data/public-github-hosted-runners.txt` is generated from GitHub Docs and used
+at runtime by the CLI and action wrapper.
+
+The updater script lives at:
+
+- `scripts/update-public-github-hosted-runners.sh`
+
+The ready-to-use GitHub Actions workflow template lives at:
+
+- `contrib/update-public-github-hosted-runners.workflow.yml`
+
+That workflow template is intentionally not active in this repository because
+GitHub Marketplace action repositories must not contain workflow files. Run it
+from a companion automation repository or another repository that can open pull
+requests against this one. Set `TARGET_REPOSITORY` in the workflow template to
+the repository you want to update, and provide an `UPDATER_TOKEN` secret that
+can push branches and open pull requests there.

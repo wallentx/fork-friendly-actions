@@ -1,0 +1,49 @@
+name: Update Public GitHub-Hosted Runners
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+env:
+  TARGET_REPOSITORY: wallentx/fork-friendly-actions
+  TARGET_PATH: target-repo
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPOSITORY }}
+          path: ${{ env.TARGET_PATH }}
+          token: ${{ secrets.UPDATER_TOKEN }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Refresh public runner list
+        working-directory: ${{ env.TARGET_PATH }}
+        run: sh scripts/update-public-github-hosted-runners.sh
+
+      - name: Run tests
+        working-directory: ${{ env.TARGET_PATH }}
+        run: npm test
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.UPDATER_TOKEN }}
+          path: ${{ env.TARGET_PATH }}
+          commit-message: "chore: refresh public GitHub-hosted runner list"
+          branch: chore/update-public-github-hosted-runners
+          delete-branch: true
+          title: "chore: refresh public GitHub-hosted runner list"
+          body: |
+            Automated refresh of `data/public-github-hosted-runners.txt` from GitHub Docs.
+
+            Source:
+            `https://docs.github.com/en/enterprise-cloud@latest/actions/reference/runners/github-hosted-runners.md`

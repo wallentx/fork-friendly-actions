@@ -48,6 +48,7 @@ function escapeCommandValue(value) {
 
 function main() {
   const workflows = getInput("workflows", DEFAULT_WORKFLOWS_DIR);
+  const upstreamRepo = getInput("upstream-repo", process.env.GITHUB_REPOSITORY || "");
   const upstreamOwner = getInput("upstream-owner", process.env.GITHUB_REPOSITORY_OWNER || "");
   const mode = getInput("mode", "check").toLowerCase();
   const failOn = getInput("fail-on", mode === "fix" ? "none" : "error").toLowerCase();
@@ -68,8 +69,8 @@ function main() {
 
   const result =
     mode === "fix"
-      ? fixWorkflows({ workflows, upstreamOwner, allowRunners, runnerFallback })
-      : auditWorkflows({ workflows, upstreamOwner, allowRunners });
+      ? fixWorkflows({ workflows, upstreamRepo, upstreamOwner, allowRunners, runnerFallback })
+      : auditWorkflows({ workflows, upstreamRepo, upstreamOwner, allowRunners });
 
   for (const finding of result.findings) {
     annotate(finding);

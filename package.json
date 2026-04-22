@@ -9,6 +9,7 @@
   "files": [
     "action.yml",
     "bin",
+    "data",
     "src",
     "README.md",
     "LICENSE"
@@ -16,6 +17,7 @@
   "scripts": {
     "build": "npm run test && npm run build:standalone",
     "build:standalone": "node scripts/build-standalone.js",
+    "update:public-runners": "sh scripts/update-public-github-hosted-runners.sh",
     "test": "node --test"
   },
   "engines": {
