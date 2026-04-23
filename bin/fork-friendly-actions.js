@@ -21,7 +21,8 @@ function main(argv) {
     return 0;
   }
 
-  const cwd = path.resolve(parsed.cwd || process.cwd());
+  const target = resolveCliTarget(parsed);
+  const cwd = target.cwd;
   const interactiveMode = Boolean(parsed.interactive);
   const fixMode = Boolean(parsed.fix || interactiveMode);
   const upstreamRepo = parsed.upstreamRepo || detectRepoSlugFromGit(cwd);
@@ -33,7 +34,7 @@ function main(argv) {
 
   const options = {
     cwd,
-    workflows: parsed.workflows || DEFAULT_WORKFLOWS_DIR,
+    workflows: target.workflows,
     upstreamRepo,
     upstreamOwner,
     allowRunners: parsed.allowRunners || "",
@@ -130,6 +131,36 @@ function requireValue(args, index, flag) {
   return value;
 }
 
+function resolveCliTarget(parsed, baseCwd = process.cwd()) {
+  if (parsed.workflows) {
+    return {
+      cwd: path.resolve(baseCwd, parsed.cwd || "."),
+      workflows: parsed.workflows,
+    };
+  }
+
+  const targetPath = path.resolve(baseCwd, parsed.cwd || ".");
+  if (parsed.cwd && isExistingFile(targetPath)) {
+    return {
+      cwd: path.dirname(targetPath),
+      workflows: path.basename(targetPath),
+    };
+  }
+
+  return {
+    cwd: targetPath,
+    workflows: DEFAULT_WORKFLOWS_DIR,
+  };
+}
+
+function isExistingFile(filePath) {
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function detectRepoSlugFromGit(cwd) {
   for (const remoteName of ["upstream", "origin"]) {
     try {
@@ -194,83 +225,116 @@ function runInteractiveFix(result, { cwd, stdin = process.stdin, stdout = proces
     return { appliedChanges: 0, changedFiles: 0, skippedChanges: 0, quit: false };
   }
 
-  const acceptedEditsByFile = new Map();
-  let skippedChanges = 0;
+  const decisions = new Map();
   let quit = false;
-  let reviewedChanges = 0;
+  let currentIndex = findFirstPendingInteractiveIndex(interactiveChanges, decisions);
   let currentScrollTop = 0;
+  let focusedKey = "";
+  const resizeTracker = createResizeTracker(stdout);
 
   enterInteractiveScreen(stdout);
   try {
-    for (let index = 0; index < interactiveChanges.length; index += 1) {
-      const interactiveChange = interactiveChanges[index];
-      const priorAcceptedEdits = acceptedEditsByFile.get(interactiveChange.plan.file) || [];
-      currentScrollTop = initialScrollTopForInteractiveChange(interactiveChange, priorAcceptedEdits, stdout);
+    while (currentIndex !== -1) {
+      const interactiveChange = interactiveChanges[currentIndex];
+      const preview = buildInteractivePreview(interactiveChange.plan, decisions, interactiveChange.edit.key);
+      const visualPreview = expandInteractiveVisualLines(preview, terminalSize(stdout).columns);
+      const focusChanged = interactiveChange.edit.key !== focusedKey;
+      resizeTracker.consume();
 
-      while (true) {
-        const preview = buildInteractivePreview(interactiveChange, priorAcceptedEdits);
-        currentScrollTop = clampInteractiveScrollTop(currentScrollTop, preview.lines.length, interactiveViewportHeight(stdout));
-        renderInteractiveScreen({
-          stdout,
-          interactiveChange,
-          preview,
-          index: index + 1,
-          total: interactiveChanges.length,
-          fileCount: result.editPlans.length,
-          acceptedCount: reviewedChanges - skippedChanges,
-          skippedCount: skippedChanges,
-          scrollTop: currentScrollTop,
-        });
-
-        const choice = readChoice({ stdin, stdout });
-        if (choice === "apply") {
-          const accepted = acceptedEditsByFile.get(interactiveChange.plan.file) || [];
-          accepted.push(interactiveChange.edit);
-          acceptedEditsByFile.set(interactiveChange.plan.file, accepted);
-          reviewedChanges += 1;
-          break;
-        }
-
-        if (choice === "skip") {
-          reviewedChanges += 1;
-          skippedChanges += 1;
-          break;
-        }
-
-        if (choice === "scroll-down") {
-          currentScrollTop += 1;
-          continue;
-        }
-
-        if (choice === "scroll-up") {
-          currentScrollTop -= 1;
-          continue;
-        }
-
-        if (choice === "page-down") {
-          currentScrollTop += Math.max(interactiveViewportHeight(stdout) - 2, 1);
-          continue;
-        }
-
-        if (choice === "page-up") {
-          currentScrollTop -= Math.max(interactiveViewportHeight(stdout) - 2, 1);
-          continue;
-        }
-
-        quit = true;
-        skippedChanges += interactiveChanges.length - index;
-        break;
+      if (focusChanged) {
+        currentScrollTop = initialScrollTopForInteractiveChange(visualPreview, stdout);
+        focusedKey = interactiveChange.edit.key;
+      } else {
+        currentScrollTop = clampInteractiveScrollTop(currentScrollTop, visualPreview.lines.length, interactiveViewportHeight(stdout));
       }
 
-      if (quit) {
-        break;
+      renderInteractiveScreen({
+        stdout,
+        interactiveChange,
+        preview: visualPreview,
+        index: currentIndex + 1,
+        total: interactiveChanges.length,
+        fileCount: result.editPlans.length,
+        fileIndex: interactiveFilePosition(interactiveChanges, currentIndex).index,
+        fileTotal: interactiveFilePosition(interactiveChanges, currentIndex).total,
+        reviewCounts: summarizeInteractiveDecisions(interactiveChanges, decisions),
+        scrollTop: currentScrollTop,
+      });
+
+      const choice = readChoice({ stdin, stdout, shouldRefresh: () => resizeTracker.isPending() });
+      if (choice === "resize") {
+        continue;
       }
+
+      if (choice === "apply") {
+        decisions.set(interactiveChange.edit.key, "accepted");
+        currentIndex = nextPendingInteractiveIndex(interactiveChanges, decisions, currentIndex);
+        focusedKey = "";
+        continue;
+      }
+
+      if (choice === "skip") {
+        decisions.set(interactiveChange.edit.key, "skipped");
+        currentIndex = nextPendingInteractiveIndex(interactiveChanges, decisions, currentIndex);
+        focusedKey = "";
+        continue;
+      }
+
+      if (choice === "next-diff") {
+        currentIndex = nextPendingInteractiveIndex(interactiveChanges, decisions, currentIndex);
+        focusedKey = "";
+        continue;
+      }
+
+      if (choice === "prev-diff") {
+        currentIndex = previousPendingInteractiveIndex(interactiveChanges, decisions, currentIndex);
+        focusedKey = "";
+        continue;
+      }
+
+      if (choice === "next-file") {
+        currentIndex = nextPendingInteractiveFileIndex(interactiveChanges, decisions, currentIndex, 1);
+        focusedKey = "";
+        continue;
+      }
+
+      if (choice === "prev-file") {
+        currentIndex = nextPendingInteractiveFileIndex(interactiveChanges, decisions, currentIndex, -1);
+        focusedKey = "";
+        continue;
+      }
+
+      if (choice === "scroll-down") {
+        currentScrollTop += 1;
+        continue;
+      }
+
+      if (choice === "scroll-up") {
+        currentScrollTop -= 1;
+        continue;
+      }
+
+      if (choice === "page-down") {
+        currentScrollTop += Math.max(interactiveViewportHeight(stdout) - 2, 1);
+        continue;
+      }
+
+      if (choice === "page-up") {
+        currentScrollTop -= Math.max(interactiveViewportHeight(stdout) - 2, 1);
+        continue;
+      }
+
+      quit = true;
+      break;
     }
   } finally {
+    resizeTracker.cleanup();
     leaveInteractiveScreen(stdout);
   }
 
+  const acceptedEditsByFile = collectAcceptedInteractiveEdits(interactiveChanges, decisions);
   const applied = applyAcceptedInteractiveChanges(result.editPlans || [], acceptedEditsByFile);
+  const reviewCounts = summarizeInteractiveDecisions(interactiveChanges, decisions);
   if (applied.appliedChanges === 0) {
     console.log("No changes applied.");
   } else {
@@ -278,17 +342,17 @@ function runInteractiveFix(result, { cwd, stdin = process.stdin, stdout = proces
       `Applied ${applied.appliedChanges} accepted change${applied.appliedChanges === 1 ? "" : "s"} across ${applied.changedFiles} file${applied.changedFiles === 1 ? "" : "s"}.`
     );
   }
-  if (quit && interactiveChanges.length - reviewedChanges > 0) {
-    const remainingChanges = interactiveChanges.length - reviewedChanges;
+  if (quit && reviewCounts.pendingCount > 0) {
+    const remainingChanges = reviewCounts.pendingCount;
     console.log(`Stopped with ${remainingChanges} change${remainingChanges === 1 ? "" : "s"} left unreviewed.`);
-  } else if (skippedChanges > 0) {
-    console.log(`Skipped ${skippedChanges} change${skippedChanges === 1 ? "" : "s"}.`);
+  } else if (reviewCounts.skippedCount > 0) {
+    console.log(`Skipped ${reviewCounts.skippedCount} change${reviewCounts.skippedCount === 1 ? "" : "s"}.`);
   }
 
   return {
     appliedChanges: applied.appliedChanges,
     changedFiles: applied.changedFiles,
-    skippedChanges,
+    skippedChanges: reviewCounts.skippedCount,
     quit,
   };
 }
@@ -303,104 +367,165 @@ function flattenInteractiveChanges(editPlans) {
   return changes;
 }
 
-function buildInteractivePreview(interactiveChange, acceptedEdits) {
-  const sourceLines = String(interactiveChange.plan.originalSource).split(/\r?\n/);
-  const appliedLines = acceptedEdits.length > 0 ? applyEdits(sourceLines, acceptedEdits) : sourceLines;
-  const translatedEdit = translateInteractiveEdit(interactiveChange.edit, acceptedEdits);
-  return {
-    ...buildInteractiveBuffer(appliedLines, translatedEdit),
-    edit: translatedEdit,
-  };
-}
+function summarizeInteractiveDecisions(interactiveChanges, decisions) {
+  let acceptedCount = 0;
+  let skippedCount = 0;
+  let pendingCount = 0;
 
-function translateInteractiveEdit(edit, acceptedEdits) {
-  let start = edit.start;
-  let end = edit.end;
-
-  for (const acceptedEdit of [...acceptedEdits].sort((left, right) => left.start - right.start)) {
-    const delta = acceptedEdit.replacement.length - (acceptedEdit.end - acceptedEdit.start);
-    if (acceptedEdit.start <= start) {
-      start += delta;
-    }
-    if (acceptedEdit.start < end || (acceptedEdit.start === end && acceptedEdit.end === acceptedEdit.start)) {
-      end += delta;
+  for (const change of interactiveChanges) {
+    const decision = decisions.get(change.edit.key) || "pending";
+    if (decision === "accepted") {
+      acceptedCount += 1;
+    } else if (decision === "skipped") {
+      skippedCount += 1;
+    } else {
+      pendingCount += 1;
     }
   }
 
+  return { acceptedCount, skippedCount, pendingCount };
+}
+
+function collectAcceptedInteractiveEdits(interactiveChanges, decisions) {
+  const acceptedEditsByFile = new Map();
+
+  for (const change of interactiveChanges) {
+    if (decisions.get(change.edit.key) !== "accepted") {
+      continue;
+    }
+    const accepted = acceptedEditsByFile.get(change.plan.file) || [];
+    accepted.push(change.edit);
+    acceptedEditsByFile.set(change.plan.file, accepted);
+  }
+
+  return acceptedEditsByFile;
+}
+
+function findFirstPendingInteractiveIndex(interactiveChanges, decisions) {
+  return interactiveChanges.findIndex((change) => !decisions.has(change.edit.key));
+}
+
+function nextPendingInteractiveIndex(interactiveChanges, decisions, currentIndex) {
+  for (let index = currentIndex + 1; index < interactiveChanges.length; index += 1) {
+    if (!decisions.has(interactiveChanges[index].edit.key)) {
+      return index;
+    }
+  }
+  for (let index = 0; index < currentIndex; index += 1) {
+    if (!decisions.has(interactiveChanges[index].edit.key)) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function previousPendingInteractiveIndex(interactiveChanges, decisions, currentIndex) {
+  for (let index = currentIndex - 1; index >= 0; index -= 1) {
+    if (!decisions.has(interactiveChanges[index].edit.key)) {
+      return index;
+    }
+  }
+  for (let index = interactiveChanges.length - 1; index > currentIndex; index -= 1) {
+    if (!decisions.has(interactiveChanges[index].edit.key)) {
+      return index;
+    }
+  }
+  return currentIndex;
+}
+
+function nextPendingInteractiveFileIndex(interactiveChanges, decisions, currentIndex, direction) {
+  const currentFile = interactiveChanges[currentIndex].plan.file;
+  let sawDifferentFile = false;
+
+  for (let offset = 1; offset <= interactiveChanges.length; offset += 1) {
+    const index = (currentIndex + offset * direction + interactiveChanges.length) % interactiveChanges.length;
+    const change = interactiveChanges[index];
+    if (decisions.has(change.edit.key)) {
+      continue;
+    }
+    if (change.plan.file !== currentFile) {
+      sawDifferentFile = true;
+      return index;
+    }
+    if (sawDifferentFile) {
+      return index;
+    }
+  }
+
+  return currentIndex;
+}
+
+function interactiveFilePosition(interactiveChanges, currentIndex) {
+  const files = [...new Set(interactiveChanges.map((change) => change.plan.file))];
+  const currentFile = interactiveChanges[currentIndex].plan.file;
   return {
-    ...edit,
-    start,
-    end,
+    index: files.indexOf(currentFile) + 1,
+    total: files.length,
   };
+}
+
+function buildInteractivePreview(plan, decisions, focusedKey) {
+  return buildInteractiveReviewBuffer(String(plan.originalSource).split(/\r?\n/), plan.edits || [], decisions, focusedKey);
 }
 
 function buildInteractiveBuffer(lines, edit) {
-  const start = Math.max(edit.start, 0);
-  const end = Math.max(edit.end, start);
+  const syntheticEdit = { ...edit, key: edit.key || "__focused__" };
+  return buildInteractiveReviewBuffer(lines, [syntheticEdit], new Map(), syntheticEdit.key);
+}
+
+function buildInteractiveReviewBuffer(lines, edits, decisions, focusedKey) {
   const width = String(lines.length || 1).length;
   const bufferLines = [];
+  const sortedEdits = [...edits].sort((left, right) => left.start - right.start || left.end - right.end);
   let selectedStart = 0;
   let selectedEnd = 0;
+  let cursor = 0;
+  let foundSelection = false;
 
-  for (let index = 0; index < lines.length; index += 1) {
-    if (index === start) {
-      selectedStart = bufferLines.length;
-      for (let removeIndex = start; removeIndex < end; removeIndex += 1) {
-        bufferLines.push({
-          type: "delete",
-          selected: true,
-          marker: "-",
-          lineNumber: removeIndex + 1,
-          text: lines[removeIndex] || "",
-        });
+  for (const edit of sortedEdits) {
+    const start = Math.max(edit.start, 0);
+    const end = Math.max(edit.end, start);
+    for (let index = cursor; index < Math.min(start, lines.length); index += 1) {
+      bufferLines.push(makeInteractiveBufferLine("context", width, index + 1, lines[index] || ""));
+    }
+
+    const decision = decisions.get(edit.key) || "pending";
+    const isFocused = decision === "pending" && edit.key === focusedKey;
+    if (decision === "skipped") {
+      for (let index = start; index < Math.min(end, lines.length); index += 1) {
+        bufferLines.push(makeInteractiveBufferLine("context", width, index + 1, lines[index] || ""));
       }
-      for (const replacementLine of edit.replacement) {
-        bufferLines.push({
-          type: "add",
-          selected: true,
-          marker: "+",
-          lineNumber: "",
-          text: replacementLine,
-        });
-      }
-      selectedEnd = Math.max(bufferLines.length - 1, selectedStart);
-      index = Math.max(end - 1, index);
-      if (end > start) {
-        continue;
+      cursor = end;
+      continue;
+    }
+
+    const selectionStart = bufferLines.length;
+    if (decision === "pending") {
+      for (let index = start; index < Math.min(end, lines.length); index += 1) {
+        bufferLines.push(makeInteractiveBufferLine(isFocused ? "focused-delete" : "pending-delete", width, index + 1, lines[index] || ""));
       }
     }
 
-    bufferLines.push({
-      type: "context",
-      selected: false,
-      marker: " ",
-      lineNumber: index + 1,
-      text: lines[index] || "",
-    });
+    for (const replacementLine of edit.replacement) {
+      const type = decision === "accepted" ? "accepted-add" : isFocused ? "focused-add" : "pending-add";
+      bufferLines.push(makeInteractiveBufferLine(type, width, "", replacementLine));
+    }
+
+    const selectionEnd = Math.max(bufferLines.length - 1, selectionStart);
+    if (isFocused && !foundSelection) {
+      selectedStart = selectionStart;
+      selectedEnd = selectionEnd;
+      foundSelection = true;
+    }
+    cursor = end;
   }
 
-  if (start === lines.length) {
-    selectedStart = bufferLines.length;
-    for (const replacementLine of edit.replacement) {
-      bufferLines.push({
-        type: "add",
-        selected: true,
-        marker: "+",
-        lineNumber: "",
-        text: replacementLine,
-      });
-    }
-    selectedEnd = Math.max(bufferLines.length - 1, selectedStart);
+  for (let index = cursor; index < lines.length; index += 1) {
+    bufferLines.push(makeInteractiveBufferLine("context", width, index + 1, lines[index] || ""));
   }
 
   if (bufferLines.length === 0) {
-    bufferLines.push({
-      type: "context",
-      selected: false,
-      marker: " ",
-      lineNumber: "",
-      text: "",
-    });
+    bufferLines.push(makeInteractiveBufferLine("context", width, "", ""));
   }
 
   return {
@@ -411,8 +536,93 @@ function buildInteractiveBuffer(lines, edit) {
   };
 }
 
-function initialScrollTopForInteractiveChange(interactiveChange, acceptedEdits, stdout) {
-  const preview = buildInteractivePreview(interactiveChange, acceptedEdits);
+function makeInteractiveBufferLine(type, width, lineNumber, text) {
+  return {
+    type,
+    selected: type.startsWith("focused-"),
+    marker: type.includes("add") ? "+" : type.includes("delete") ? "-" : " ",
+    lineNumber: lineNumber === "" ? " ".repeat(width) : String(lineNumber).padStart(width),
+    text,
+  };
+}
+
+function expandInteractiveVisualLines(preview, columns) {
+  const visualLines = [];
+  let selectedStart = 0;
+  let selectedEnd = 0;
+
+  for (const line of preview.lines) {
+    const wrappedLines = wrapInteractiveBufferLine(line, columns);
+    const startIndex = visualLines.length;
+    visualLines.push(...wrappedLines);
+    if (line.selected) {
+      if (selectedStart === 0 && selectedEnd === 0) {
+        selectedStart = startIndex;
+      }
+      selectedEnd = visualLines.length - 1;
+    }
+  }
+
+  return {
+    lines: visualLines,
+    selectedStart,
+    selectedEnd,
+  };
+}
+
+function wrapInteractiveBufferLine(line, columns) {
+  const selectionMarker = line.selected ? ">" : " ";
+  const prefix = `${selectionMarker}${line.marker} ${line.lineNumber} | `;
+  const continuationPrefix = `   ${" ".repeat(line.lineNumber.length)} | `;
+  const contentWidth = Math.max(columns - prefix.length, 8);
+  const chunks = wrapPlainText(line.text || "", contentWidth);
+  const wrapped = [];
+
+  for (let index = 0; index < chunks.length; index += 1) {
+    wrapped.push({
+      type: line.type,
+      text: `${index === 0 ? prefix : continuationPrefix}${chunks[index]}`,
+    });
+  }
+
+  return wrapped;
+}
+
+function wrapPlainText(text, width) {
+  if (!text) {
+    return [""];
+  }
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > width) {
+    const slice = remaining.slice(0, width);
+    const breakIndex = findWrapBoundary(slice);
+    chunks.push(remaining.slice(0, breakIndex));
+    remaining = remaining.slice(breakIndex);
+    if (!remaining) {
+      break;
+    }
+    remaining = remaining.replace(/^[ ]+/, "");
+  }
+  if (remaining) {
+    chunks.push(remaining);
+  }
+  return chunks.length > 0 ? chunks : [""];
+}
+
+function findWrapBoundary(slice) {
+  const preferredBreaks = [" || ", " && ", " == ", " != ", ", ", " ", ")", "}", "]", "/"];
+  for (const token of preferredBreaks) {
+    const index = slice.lastIndexOf(token);
+    if (index > 0) {
+      return index + token.length;
+    }
+  }
+  return slice.length;
+}
+
+function initialScrollTopForInteractiveChange(preview, stdout) {
   const viewportHeight = interactiveViewportHeight(stdout);
   const center = Math.max(Math.floor((preview.selectedStart + preview.selectedEnd) / 2), 0);
   return clampInteractiveScrollTop(center - Math.floor(viewportHeight / 3), preview.lines.length, viewportHeight);
@@ -428,18 +638,27 @@ function interactiveViewportHeight(stdout) {
   return Math.max(rows - 6, 5);
 }
 
-function renderInteractiveScreen({ stdout, interactiveChange, preview, index, total, fileCount, acceptedCount, skippedCount, scrollTop }) {
+function renderInteractiveScreen({ stdout, interactiveChange, preview, index, total, fileCount, fileIndex, fileTotal, reviewCounts, scrollTop }) {
   const { columns, rows } = terminalSize(stdout);
   const headerLines = [
     `Interactive fix mode: ${total} proposed change${total === 1 ? "" : "s"} across ${fileCount} file${fileCount === 1 ? "" : "s"}.`,
     `[${index}/${total}] ${interactiveChange.edit.title}`,
-    `${interactiveChange.plan.file}:${preview.edit.start + 1}  accepted ${acceptedCount}  skipped ${skippedCount}`,
+    `${interactiveChange.plan.file}:${interactiveChange.edit.start + 1}  file ${fileIndex}/${fileTotal}  accepted ${reviewCounts.acceptedCount}  skipped ${reviewCounts.skippedCount}  pending ${reviewCounts.pendingCount}`,
   ];
-  const footerLines = [
-    "y apply  n skip  q quit  j/k or arrows scroll  PgUp/PgDn page",
-    `Lines ${Math.min(scrollTop + 1, preview.lines.length)}-${Math.min(scrollTop + interactiveViewportHeight(stdout), preview.lines.length)} of ${preview.lines.length}`,
-  ];
-  const bodyHeight = Math.max(rows - headerLines.length - footerLines.length - 1, 5);
+  const footerLines = [];
+  footerLines.push(...buildInteractiveLegendLines(columns, [
+    ["y", "apply"],
+    ["n", "skip"],
+    ["q", "quit"],
+    ["← →", "prev/next diff"],
+    ["↑ ↓", "scroll"],
+    ["PgUp PgDn", "page"],
+  ]));
+  if (fileTotal > 1) {
+    footerLines.push(...buildInteractiveLegendLines(columns, [["{ }", "prev/next file"]]));
+  }
+  footerLines.push(paint("yellow", `Lines ${Math.min(scrollTop + 1, preview.lines.length)}-${Math.min(scrollTop + interactiveViewportHeight(stdout), preview.lines.length)} of ${preview.lines.length}`));
+  const bodyHeight = Math.max(rows - headerLines.length - footerLines.length - 2, 5);
   const visibleLines = preview.lines.slice(scrollTop, scrollTop + bodyHeight);
 
   const output = [];
@@ -450,39 +669,74 @@ function renderInteractiveScreen({ stdout, interactiveChange, preview, index, to
   output.push(paint("gray", truncateLine("─".repeat(Math.max(columns, 1)), columns)));
 
   for (const line of visibleLines) {
-    output.push(renderInteractiveBufferLine(line, preview.width, columns));
+    output.push(renderInteractiveBufferLine(line, columns));
   }
   for (let index = visibleLines.length; index < bodyHeight; index += 1) {
     output.push("");
   }
 
   output.push(paint("gray", truncateLine("─".repeat(Math.max(columns, 1)), columns)));
-  output.push(paint("gray", truncateLine(footerLines[0], columns)));
-  output.push(paint("gray", truncateLine(footerLines[1], columns)));
+  for (const footerLine of footerLines) {
+    output.push(footerLine);
+  }
 
   stdout.write(output.join("\n"));
 }
 
-function renderInteractiveBufferLine(line, width, columns) {
-  const selectionMarker = line.selected ? ">" : " ";
-  const lineNumber = line.lineNumber === "" ? " ".repeat(width) : String(line.lineNumber).padStart(width);
-  const rendered = `${selectionMarker}${line.marker} ${lineNumber} | ${line.text}`;
-  const truncated = truncateLine(rendered, columns);
+function buildInteractiveLegendLines(columns, items) {
+  const lines = [];
+  let currentLine = "";
 
-  if (line.selected && line.type === "add") {
+  for (const item of items) {
+    const renderedItem = formatInteractiveLegendItem(item);
+    const separator = currentLine ? paint("gray", "  ") : "";
+    const candidate = currentLine ? `${currentLine}${separator}${renderedItem}` : renderedItem;
+
+    if (currentLine && visibleTextWidth(candidate) > columns) {
+      lines.push(currentLine);
+      currentLine = renderedItem;
+      continue;
+    }
+
+    currentLine = candidate;
+  }
+
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+
+  return lines;
+}
+
+function formatInteractiveLegendItem([key, label]) {
+  return `${paintStyle("legendKey", key)} ${paint("cyan", label)}`;
+}
+
+function stripAnsi(text) {
+  return String(text).replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
+function visibleTextWidth(text) {
+  return stripAnsi(text).length;
+}
+
+function renderInteractiveBufferLine(line, columns) {
+  const truncated = truncateLine(line.text, columns);
+
+  if (line.type === "focused-add") {
     return paintStyle("selectedAdd", truncated);
   }
-  if (line.selected && line.type === "delete") {
+  if (line.type === "focused-delete") {
     return paintStyle("selectedDelete", truncated);
   }
-  if (line.selected) {
-    return paintStyle("selected", truncated);
+  if (line.type === "pending-add") {
+    return paint("dimGreen", truncated);
   }
-  if (line.type === "add") {
+  if (line.type === "pending-delete") {
+    return paint("dimRed", truncated);
+  }
+  if (line.type === "accepted-add") {
     return paint("green", truncated);
-  }
-  if (line.type === "delete") {
-    return paint("red", truncated);
   }
   return truncated;
 }
@@ -508,6 +762,55 @@ function enterInteractiveScreen(stdout) {
 
 function leaveInteractiveScreen(stdout) {
   stdout.write("\u001b[?25h\u001b[?1049l");
+}
+
+function createResizeTracker(stdout) {
+  let pending = false;
+  const listeners = [];
+  const onResize = () => {
+    pending = true;
+  };
+
+  for (const target of [stdout, process.stdout]) {
+    if (!target || typeof target.on !== "function") {
+      continue;
+    }
+    target.on("resize", onResize);
+    listeners.push(() => {
+      if (typeof target.off === "function") {
+        target.off("resize", onResize);
+      } else if (typeof target.removeListener === "function") {
+        target.removeListener("resize", onResize);
+      }
+    });
+  }
+
+  if (typeof process.on === "function") {
+    process.on("SIGWINCH", onResize);
+    listeners.push(() => {
+      if (typeof process.off === "function") {
+        process.off("SIGWINCH", onResize);
+      } else if (typeof process.removeListener === "function") {
+        process.removeListener("SIGWINCH", onResize);
+      }
+    });
+  }
+
+  return {
+    isPending() {
+      return pending;
+    },
+    consume() {
+      const value = pending;
+      pending = false;
+      return value;
+    },
+    cleanup() {
+      for (const remove of listeners) {
+        remove();
+      }
+    },
+  };
 }
 
 function applyAcceptedInteractiveChanges(editPlans, acceptedEditsByFile) {
@@ -541,7 +844,7 @@ function applyEdits(lines, edits) {
   return fixed;
 }
 
-function readInteractiveChoice({ stdin = process.stdin, stdout = process.stdout, readSync = fs.readSync, sleep = sleepMs } = {}) {
+function readInteractiveChoice({ stdin = process.stdin, stdout = process.stdout, readSync = fs.readSync, sleep = sleepMs, shouldRefresh = () => false } = {}) {
   const buffer = Buffer.alloc(16);
   const wasRaw = Boolean(stdin.isRaw);
 
@@ -550,17 +853,26 @@ function readInteractiveChoice({ stdin = process.stdin, stdout = process.stdout,
     stdin.resume();
 
     while (true) {
+      if (shouldRefresh()) {
+        return "resize";
+      }
       let bytesRead = 0;
       try {
         bytesRead = readSync(stdin.fd, buffer, 0, buffer.length, null);
       } catch (error) {
         if (isRetryableReadError(error)) {
+          if (shouldRefresh()) {
+            return "resize";
+          }
           sleep(10);
           continue;
         }
         throw error;
       }
       if (bytesRead <= 0) {
+        if (shouldRefresh()) {
+          return "resize";
+        }
         sleep(10);
         continue;
       }
@@ -604,7 +916,7 @@ function parseInteractiveChoice(input) {
   if (first === "n") {
     return "skip";
   }
-  if (first === "q" || first === "\u001b" || first === "\u0003") {
+  if (first === "q" || text === "\u001b" || text === "\u0003") {
     return "quit";
   }
   return "";
@@ -612,10 +924,14 @@ function parseInteractiveChoice(input) {
 
 function parseInteractiveAction(input) {
   const text = Buffer.isBuffer(input) ? input.toString("utf8") : String(input || "");
-  if (text === "j" || text === "\u001b[B") {
+  const mouseScroll = parseMouseScrollAction(text);
+  if (mouseScroll) {
+    return mouseScroll;
+  }
+  if (text === "\u001b[B") {
     return "scroll-down";
   }
-  if (text === "k" || text === "\u001b[A") {
+  if (text === "\u001b[A") {
     return "scroll-up";
   }
   if (text === "\u001b[6~") {
@@ -624,7 +940,52 @@ function parseInteractiveAction(input) {
   if (text === "\u001b[5~") {
     return "page-up";
   }
+  if (text === "\u001b[C") {
+    return "next-diff";
+  }
+  if (text === "\u001b[D") {
+    return "prev-diff";
+  }
+  if (text === "]") {
+    return "next-diff";
+  }
+  if (text === "[") {
+    return "prev-diff";
+  }
+  if (text === "}") {
+    return "next-file";
+  }
+  if (text === "{") {
+    return "prev-file";
+  }
   return parseInteractiveChoice(text);
+}
+
+function parseMouseScrollAction(text) {
+  const sgrMouse = text.match(/\u001b\[<(\d+);\d+;\d+[mM]/);
+  if (sgrMouse) {
+    const button = Number(sgrMouse[1]);
+    if (button === 64) {
+      return "scroll-up";
+    }
+    if (button === 65) {
+      return "scroll-down";
+    }
+    return "";
+  }
+
+  const legacyMouse = text.match(/\u001b\[M([\s\S])/);
+  if (legacyMouse) {
+    const button = legacyMouse[1].charCodeAt(0) - 32;
+    if (button === 64) {
+      return "scroll-up";
+    }
+    if (button === 65) {
+      return "scroll-down";
+    }
+  }
+
+  return "";
 }
 
 function printResult(result, { fixMode, cwd, dryRun }) {
@@ -1002,9 +1363,13 @@ function paint(color, text) {
   const codes = {
     gray: "\u001b[90m",
     red: "\u001b[31m",
+    dimRed: "\u001b[2;31m",
     green: "\u001b[32m",
-    yellow: "\u001b[33m",
-    cyan: "\u001b[36m",
+    dimGreen: "\u001b[2;32m",
+    yellow: "\u001b[93m",
+    blue: "\u001b[34m",
+    magenta: "\u001b[95m",
+    cyan: "\u001b[96m",
   };
 
   return `${codes[color] || ""}${text}\u001b[0m`;
@@ -1019,6 +1384,7 @@ function paintStyle(style, text) {
     selected: "\u001b[7m",
     selectedAdd: "\u001b[1;30;102m",
     selectedDelete: "\u001b[1;37;41m",
+    legendKey: "\u001b[1;4;95m",
   };
 
   return `${codes[style] || ""}${text}\u001b[0m`;
@@ -1049,7 +1415,7 @@ Options:
   -h, --help                  Show this help.
 
 Arguments:
-  [path]                      Project checkout to evaluate. Default: current directory.
+  [path]                      Project checkout, workflow directory, or workflow file. Default: current directory.
 `);
 }
 
@@ -1065,6 +1431,7 @@ if (require.main === module) {
 module.exports = {
   applyAcceptedInteractiveChanges,
   buildInteractiveBuffer,
+  buildInteractiveLegendLines,
   detectRepoSlugFromGit,
   main,
   parseInteractiveAction,
@@ -1073,5 +1440,7 @@ module.exports = {
   parseArgs,
   parseOwnerFromRemote,
   parseRepoSlugFromRemote,
+  resolveCliTarget,
   runInteractiveFix,
+  wrapInteractiveBufferLine,
 };

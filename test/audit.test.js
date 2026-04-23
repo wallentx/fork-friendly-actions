@@ -21,6 +21,7 @@ const {
 const {
   detectRepoSlugFromGit,
   buildInteractiveBuffer,
+  buildInteractiveLegendLines,
   main,
   parseInteractiveAction,
   parseArgs,
@@ -28,7 +29,9 @@ const {
   parseOwnerFromRemote,
   parseRepoSlugFromRemote,
   readInteractiveChoice,
+  resolveCliTarget,
   runInteractiveFix,
+  wrapInteractiveBufferLine,
 } = require("../bin/fork-friendly-actions.js");
 
 function audit(source) {
@@ -183,7 +186,7 @@ jobs:
   assert.equal(findings[0].line, 7);
 });
 
-test("propagates upstream-only gating through needs dependencies", () => {
+test("does not flag normal needs dependencies because GitHub skips them by default", () => {
   const findings = audit(`
 name: CI
 on: pull_request
@@ -199,10 +202,31 @@ jobs:
       - run: echo test
 `);
 
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.RUNNER_LABEL.code);
+});
+
+test("flags needs dependencies when a job-level always condition bypasses skipped dependencies", () => {
+  const findings = audit(`
+name: CI
+on: pull_request
+jobs:
+  image:
+    runs-on: [self-hosted, linux]
+    steps:
+      - run: echo build
+  test:
+    if: always()
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+`);
+
   assert.equal(findings.length, 2);
   assert.equal(findings[0].ruleCode, RULES.RUNNER_LABEL.code);
   assert.equal(findings[1].ruleCode, RULES.NEEDS_GATE.code);
-  assert.equal(findings[1].line, 10);
+  assert.equal(findings[1].line, 11);
 });
 
 test("flags reusable workflow caller secrets while allowing GITHUB_TOKEN", () => {
@@ -726,7 +750,7 @@ jobs:
   assert.equal(result.changes.length, 1);
 });
 
-test("fixes dependent jobs when an upstream-only prerequisite is skipped on forks", () => {
+test("does not fix normal dependent jobs because GitHub skips them by default", () => {
   const result = fixWorkflowFile({
     filePath: "/repo/.github/workflows/ci.yml",
     source: `
@@ -748,7 +772,34 @@ jobs:
   });
 
   assert.match(result.fixedSource, /image:\n    if: github\.repository == 'ExampleOrg\/example-repo'\n    runs-on: \[self-hosted, linux\]/);
-  assert.match(result.fixedSource, /test:\n    if: github\.repository == 'ExampleOrg\/example-repo'\n    needs: image/);
+  assert.doesNotMatch(result.fixedSource, /test:\n    if: github\.repository == 'ExampleOrg\/example-repo'\n    needs: image/);
+  assert.equal(result.changes.length, 1);
+});
+
+test("fixes dependent jobs when always bypasses a skipped upstream-only prerequisite", () => {
+  const result = fixWorkflowFile({
+    filePath: "/repo/.github/workflows/ci.yml",
+    source: `
+name: CI
+on: pull_request
+jobs:
+  image:
+    runs-on: [self-hosted, linux]
+    steps:
+      - run: echo build
+  test:
+    if: always()
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo test
+`,
+    cwd: "/repo",
+    upstreamRepo: "ExampleOrg/example-repo",
+  });
+
+  assert.match(result.fixedSource, /image:\n    if: github\.repository == 'ExampleOrg\/example-repo'\n    runs-on: \[self-hosted, linux\]/);
+  assert.match(result.fixedSource, /test:\n    if: github\.repository == 'ExampleOrg\/example-repo' && \(always\(\)\)\n    needs: image/);
   assert.equal(result.changes.length, 2);
 });
 
@@ -1070,6 +1121,63 @@ test("parses short aliases and positional path", () => {
   assert.throws(() => parseArgs(["-i", "-d"]), /cannot be combined/);
 });
 
+test("resolves positional workflow files relative to their containing directory", () => {
+  const tmpDir = fs.mkdtempSync(path.join(process.cwd(), "tmp-ffactions-target-"));
+  try {
+    const workflowsDir = path.join(tmpDir, "fixtures");
+    const workflowPath = path.join(workflowsDir, "workflow.yml");
+    fs.mkdirSync(workflowsDir, { recursive: true });
+    fs.writeFileSync(workflowPath, "name: fixture\n");
+
+    assert.deepEqual(resolveCliTarget({ cwd: workflowPath }, tmpDir), {
+      cwd: workflowsDir,
+      workflows: "workflow.yml",
+    });
+    assert.deepEqual(resolveCliTarget({ cwd: workflowsDir }, tmpDir), {
+      cwd: workflowsDir,
+      workflows: ".github/workflows",
+    });
+    assert.deepEqual(resolveCliTarget({ cwd: workflowsDir, workflows: "workflow.yml" }, tmpDir), {
+      cwd: workflowsDir,
+      workflows: "workflow.yml",
+    });
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("positional workflow files detect origin remote from the containing repo", () => {
+  const tmpDir = fs.mkdtempSync(path.join(process.cwd(), "tmp-ffactions-file-origin-"));
+  try {
+    childProcess.execFileSync("git", ["init"], { cwd: tmpDir, stdio: "ignore" });
+    childProcess.execFileSync("git", ["remote", "add", "origin", "git@github.com:ExampleOrg/example-repo.git"], {
+      cwd: tmpDir,
+      stdio: "ignore",
+    });
+    const fixturesDir = path.join(tmpDir, "test", "fixtures");
+    fs.mkdirSync(fixturesDir, { recursive: true });
+    const workflowPath = path.join(fixturesDir, "workflow.yml");
+    fs.writeFileSync(
+      workflowPath,
+      `name: CI
+on: pull_request
+jobs:
+  benchmark:
+    runs-on: benchmark
+    steps:
+      - run: npm test
+`
+    );
+
+    const result = runCli(["-d", workflowPath], { NO_COLOR: "1" });
+
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /github\.repository == 'ExampleOrg\/example-repo'/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("parses interactive keypress choices", () => {
   assert.equal(parseInteractiveChoice("y"), "apply");
   assert.equal(parseInteractiveChoice("Y"), "apply");
@@ -1081,12 +1189,23 @@ test("parses interactive keypress choices", () => {
 });
 
 test("parses interactive reviewer navigation keys", () => {
-  assert.equal(parseInteractiveAction("j"), "scroll-down");
-  assert.equal(parseInteractiveAction("k"), "scroll-up");
+  assert.equal(parseInteractiveAction("j"), "");
+  assert.equal(parseInteractiveAction("k"), "");
   assert.equal(parseInteractiveAction("\u001b[B"), "scroll-down");
   assert.equal(parseInteractiveAction("\u001b[A"), "scroll-up");
+  assert.equal(parseInteractiveAction("\u001b[C"), "next-diff");
+  assert.equal(parseInteractiveAction("\u001b[D"), "prev-diff");
   assert.equal(parseInteractiveAction("\u001b[6~"), "page-down");
   assert.equal(parseInteractiveAction("\u001b[5~"), "page-up");
+  assert.equal(parseInteractiveAction("]"), "next-diff");
+  assert.equal(parseInteractiveAction("["), "prev-diff");
+  assert.equal(parseInteractiveAction("}"), "next-file");
+  assert.equal(parseInteractiveAction("{"), "prev-file");
+  assert.equal(parseInteractiveAction("\u001b[<64;40;12M"), "scroll-up");
+  assert.equal(parseInteractiveAction("\u001b[<65;40;12M"), "scroll-down");
+  assert.equal(parseInteractiveAction("\u001b[<35;40;12M"), "");
+  assert.equal(parseInteractiveAction("\u001b[<35;40;12m"), "");
+  assert.equal(parseInteractiveAction("\u001b[?1002;1006h"), "");
 });
 
 test("interactive choice reader retries EAGAIN reads", () => {
@@ -1138,10 +1257,48 @@ test("builds interactive buffers with inline selected diff lines", () => {
   assert.deepEqual(
     preview.lines.slice(3, 5).map((line) => ({ type: line.type, selected: line.selected, marker: line.marker })),
     [
-      { type: "delete", selected: true, marker: "-" },
-      { type: "add", selected: true, marker: "+" },
+      { type: "focused-delete", selected: true, marker: "-" },
+      { type: "focused-add", selected: true, marker: "+" },
     ]
   );
+});
+
+test("wraps interactive legend items instead of truncating them on narrow terminals", () => {
+  const legendLines = buildInteractiveLegendLines(20, [
+    ["y", "apply"],
+    ["n", "skip"],
+    ["q", "quit"],
+    ["← →", "prev/next diff"],
+    ["↑ ↓", "scroll"],
+    ["PgUp PgDn", "page"],
+  ]);
+
+  const joined = legendLines.join("\n");
+
+  assert.ok(legendLines.length >= 4);
+  assert.match(joined, /apply/);
+  assert.match(joined, /skip/);
+  assert.match(joined, /quit/);
+  assert.match(joined, /prev\/next diff/);
+  assert.match(joined, /scroll/);
+  assert.match(joined, /PgUp PgDn/);
+  assert.match(joined, /page/);
+  assert.doesNotMatch(joined, /…/);
+});
+
+test("aligns wrapped interactive buffer continuation bars with the first row", () => {
+  const wrapped = wrapInteractiveBufferLine({
+    type: "focused-add",
+    selected: true,
+    marker: "+",
+    lineNumber: "  94",
+    text: "runs-on: ${{ github.repository == 'wallentx/fork-friendly-actions' && 'ubuntu-latest-16-cores' || 'ubuntu-latest' }}",
+  }, 70);
+
+  assert.ok(wrapped.length > 1);
+  const firstBar = wrapped[0].text.indexOf("|");
+  const secondBar = wrapped[1].text.indexOf("|");
+  assert.equal(secondBar, firstBar);
 });
 
 test("rule codes use stable FFxxx identifiers", () => {

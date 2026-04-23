@@ -1,0 +1,295 @@
+# Fixture: complex workflow coverage for ffactions.
+#
+# This file is intentionally not installed under .github/workflows. It is a
+# regression fixture with both true positives and false-positive guards.
+#
+# Expected true positives:
+# - FF001: private runner labels, self-hosted runners, runner groups
+# - FF002: unresolved or fork-hostile dynamic runner expressions
+# - FF003: normal secrets and secrets: inherit without an upstream guard
+# - FF004: publish, release-write, deploy, and cloud-auth steps
+# - FF005: snapshot jobs without an upstream guard
+# - FF006: needs dependencies on upstream-only jobs
+# - FF007: consumers of outputs produced by upstream-only steps
+#
+# Expected allowed / false-positive guards:
+# - public GitHub-hosted runners
+# - matrix runners that resolve only to public labels
+# - secrets.GITHUB_TOKEN
+# - upstream-gated jobs and steps
+# - read-only release commands
+# - publish/release words in step names when no publish action is performed
+
+name: Complex fork-friendly fixture
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: ubuntu-latest
+    outputs:
+      promoted-version:
+        description: Version emitted by an upstream-only release job.
+        value: ${{ jobs.release.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  public-runner-ok:
+    name: Public runner should be allowed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: GITHUB_TOKEN is allowed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view latest || true
+
+  public-matrix-ok:
+    name: Public matrix should be allowed
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: npm test
+
+  nested-public-matrix-ok:
+    name: Nested indexed matrix should be allowed after exclude
+    strategy:
+      matrix:
+        os:
+          - name: linux
+            runs-on:
+              x64: ubuntu-latest
+              arm: ubuntu-24.04-arm
+          - name: windows
+            runs-on:
+              x64: windows-latest
+        arch:
+          - key: x64
+          - key: arm
+        exclude:
+          - os:
+              name: windows
+            arch:
+              key: arm
+    runs-on: ${{ matrix.os.runs-on[matrix.arch.key] }}
+    steps:
+      - run: echo "all resolved runners are public"
+
+  private-scalar-runner:
+    name: Private scalar runner should get a fork fallback
+    runs-on: ubuntu-latest-16-cores
+    steps:
+      - run: cargo test
+
+  paid-runner-fallback:
+    name: Paid GitHub-hosted runner should get an equivalent free fallback
+    runs-on: macos-latest-large
+    steps:
+      - run: xcodebuild -version
+
+  self-hosted-runner:
+    name: Self-hosted jobs should be upstream-only
+    runs-on:
+      - self-hosted
+      - Linux
+      - ARM64
+    steps:
+      - run: ./scripts/internal-hardware-test.sh
+
+  grouped-runner:
+    name: Runner groups should be upstream-only
+    runs-on:
+      group: internal-linux-large
+      labels:
+        - ubuntu-latest-16-cores
+    steps:
+      - run: ./scripts/load-test.sh
+
+  inline-grouped-runner:
+    name: Inline runner groups should also be upstream-only
+    runs-on: { group: internal-macos, labels: [macos-15-xlarge] }
+    steps:
+      - run: ./scripts/signing-host-smoke-test.sh
+
+  dynamic-private-matrix:
+    name: Dynamic matrix with private labels should be caught
+    strategy:
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-latest-8-cores
+          - macos-15-xlarge
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - run: make test
+
+  unresolved-input-runner:
+    name: Reusable workflow input runner should be unresolved
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - run: echo "runner is supplied by caller"
+
+  secret-step:
+    name: Ungated normal secrets should be caught
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload package with secret token
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: twine upload dist/*
+
+  secret-output-producer:
+    name: Secret checker produces outputs
+    runs-on: ubuntu-latest
+    outputs:
+      has-signing: ${{ steps.check.outputs.has_signing }}
+    steps:
+      - name: Check signing material
+        id: check
+        env:
+          SIGNING_CERT: ${{ secrets.SIGNING_CERT_P12 }}
+        run: |
+          if [ -n "$SIGNING_CERT" ]; then
+            echo "has_signing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_signing=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Consume gated step output
+        if: steps.check.outputs.has_signing == 'true'
+        run: ./scripts/sign.sh
+
+  output-consumer:
+    name: Job output consumer should inherit gating
+    runs-on: ubuntu-latest
+    needs:
+      - secret-output-producer
+    steps:
+      - name: Use gated job output
+        if: needs.secret-output-producer.outputs.has-signing == 'true'
+        run: ./scripts/publish-signed-artifacts.sh
+
+  publish-noise-ok:
+    name: Publish words without publishing should not be caught
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine npm publish settings
+        run: echo "publish=false" >> "$GITHUB_OUTPUT"
+      - name: Read release metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view latest || true
+          gh release download latest --pattern checksums.txt || true
+
+  release-write:
+    name: Release-write commands should be caught
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: gh release create "$VERSION" dist/*
+
+  cloud-auth:
+    name: Cloud auth should be caught
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_DEPLOYER_JSON }}
+      - name: Deploy service
+        run: gcloud run deploy fixture-service --image gcr.io/example/app
+
+  reusable-secret-inherit:
+    name: secrets inherit should be caught
+    uses: owner/repo/.github/workflows/reusable-release.yml@v1
+    secrets: inherit
+
+  reusable-github-token-ok:
+    name: Passing only GITHUB_TOKEN should be allowed
+    uses: owner/repo/.github/workflows/reusable-check.yml@v1
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+
+  reusable-secret-pass:
+    name: Passing normal secrets should be caught
+    uses: owner/repo/.github/workflows/reusable-release.yml@v1
+    secrets:
+      npm-token: ${{ secrets.NPM_TOKEN }}
+
+  upstream-gated-job-ok:
+    name: Existing upstream job guard should be respected
+    if: github.repository == 'ExampleOrg/example-repo'
+    runs-on: ubuntu-latest-8-cores
+    steps:
+      - name: Secret is okay because job is gated
+        env:
+          PRIVATE_TOKEN: ${{ secrets.INTERNAL_TOKEN }}
+        run: ./scripts/internal-only.sh
+
+  upstream-gated-step-ok:
+    name: Existing upstream step guard should be respected
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish only upstream
+        if: github.repository == 'ExampleOrg/example-repo'
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish
+
+  snapshot-job:
+    name: Snapshot jobs should be upstream-only
+    runs-on: ubuntu-latest
+    snapshot:
+      image-name: fixture-snapshot
+      version: 1
+    steps:
+      - run: echo "build custom runner image"
+
+  downstream-needs-private:
+    name: Plain needs dependency should be skipped by GitHub
+    runs-on: ubuntu-latest
+    needs:
+      - self-hosted-runner
+      - grouped-runner
+    steps:
+      - run: echo "GitHub should skip this when upstream-only jobs are skipped"
+
+  downstream-needs-always:
+    name: always() should bypass skipped needs and be caught
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - self-hosted-runner
+      - grouped-runner
+    steps:
+      - run: echo "This would run despite skipped upstream-only jobs"
+
+  release:
+    name: Reusable workflow output producer
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Compute version with release secret
+        id: version
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: echo "version=1.2.3" >> "$GITHUB_OUTPUT"

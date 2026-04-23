@@ -43,8 +43,8 @@ const RULES = Object.freeze({
   NEEDS_GATE: {
     code: "FF006",
     slug: "needs-gate",
-    title: "Dependent job is not upstream-gated",
-    description: "If a job depends on another job that is upstream-only or skipped on forks, the dependent job should also be upstream-gated.",
+    title: "Dependent job bypasses upstream-only skip",
+    description: "Jobs with conditions like always() can run even when an upstream-only dependency is skipped, so those bypasses should be upstream-gated.",
   },
   OUTPUT_GATE: {
     code: "FF007",
@@ -1247,7 +1247,7 @@ function collectNeedsPropagationFindings({ jobs, reverseNeeds, initiallyGatedJob
         continue;
       }
 
-      if (job.hasOwnerGuard) {
+      if (job.hasOwnerGuard || !jobBypassesSkippedNeeds(job)) {
         continue;
       }
 
@@ -1261,7 +1261,7 @@ function collectNeedsPropagationFindings({ jobs, reverseNeeds, initiallyGatedJob
         rule: RULES.NEEDS_GATE.slug,
         ruleCode: RULES.NEEDS_GATE.code,
         title: RULES.NEEDS_GATE.title,
-        message: `This job depends on ${gatedNeeds.join(", ")}, which ${gatedNeeds.length === 1 ? "is" : "are"} upstream-only or skipped on forks. Dependent jobs should also be skipped on forks.${formatScopeHint(upstreamScope)}`,
+        message: `This job depends on ${gatedNeeds.join(", ")}, which ${gatedNeeds.length === 1 ? "is" : "are"} upstream-only or skipped on forks, but its job-level condition can bypass the default needs skip behavior.${formatScopeHint(upstreamScope)}`,
         fixable: jobEdit != null,
       });
       if (jobEdit) {
@@ -1271,6 +1271,14 @@ function collectNeedsPropagationFindings({ jobs, reverseNeeds, initiallyGatedJob
   }
 
   return { findings, edits, gatedJobIds: visited };
+}
+
+function jobBypassesSkippedNeeds(job) {
+  const condition = String(job.parsed && job.parsed.if ? job.parsed.if : "").trim();
+  if (!condition) {
+    return false;
+  }
+  return /\balways\s*\(/.test(condition);
 }
 
 function addMatrixValue(values, key, value) {
@@ -1774,6 +1782,18 @@ function makeOwnerGuardEdit({ step, job, upstreamScope }) {
   }
 
   if (step && !step.hasOwnerGuard) {
+    const existingIfEdit = makeGuardedIfEdit({
+      ifLine: step.parsed && step.parsed.ifLine,
+      ifValue: step.parsed && step.parsed.if,
+      indent: step.indent + 2,
+      upstreamScope,
+      title: "Add owner guard to step condition",
+      key: `replace:${step.parsed && step.parsed.ifLine}:step-owner-guard`,
+    });
+    if (existingIfEdit) {
+      return existingIfEdit;
+    }
+
     return {
       start: step.startIndex + 1,
       end: step.startIndex + 1,
@@ -1784,6 +1804,18 @@ function makeOwnerGuardEdit({ step, job, upstreamScope }) {
   }
 
   if (job && !job.hasOwnerGuard) {
+    const existingIfEdit = makeGuardedIfEdit({
+      ifLine: job.parsed && job.parsed.ifLine,
+      ifValue: job.parsed && job.parsed.if,
+      indent: job.bodyIndent,
+      upstreamScope,
+      title: "Add owner guard to job condition",
+      key: `replace:${job.parsed && job.parsed.ifLine}:job-owner-guard`,
+    });
+    if (existingIfEdit) {
+      return existingIfEdit;
+    }
+
     return {
       start: job.startIndex + 1,
       end: job.startIndex + 1,
@@ -1794,6 +1826,25 @@ function makeOwnerGuardEdit({ step, job, upstreamScope }) {
   }
 
   return null;
+}
+
+function makeGuardedIfEdit({ ifLine, ifValue, indent, upstreamScope, title, key }) {
+  if (!ifLine || !ifValue) {
+    return null;
+  }
+
+  const existingCondition = stripExpressionDelimiters(ifValue);
+  if (!existingCondition) {
+    return null;
+  }
+
+  return {
+    start: ifLine - 1,
+    end: ifLine,
+    replacement: [`${" ".repeat(indent)}if: ${upstreamScope.guardExpression} && (${existingCondition})`],
+    title,
+    key,
+  };
 }
 
 function applyEdits(lines, edits) {

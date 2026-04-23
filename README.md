@@ -22,71 +22,68 @@ regex heuristics so the behavior is deterministic and reviewable.
 
 ## CLI Usage
 
-Run this from a project checkout:
+Build the standalone executable from this repo:
 
 ```sh
-npx fork-friendly-actions
+npm i
+npm run build
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/dist/ffactions" ~/.local/bin/ffactions
 ```
 
-By default, the CLI evaluates `.github/workflows` and reports findings without
-changing files. For fork workflows, it prefers the `upstream` git remote and
-falls back to `origin` to determine the upstream repository scope. That repo
-slug is the default source of truth for gating and fixes.
+After that, run `ffactions` from any project checkout. By default, it evaluates
+`.github/workflows` and reports findings without changing files. For fork
+workflows, it prefers the `upstream` git remote and falls back to `origin` to
+determine the upstream repository scope. That repo slug is the default source
+of truth for gating and fixes.
 
-To apply fixable changes, use the `-f` or `--fix` flag:
-
-```sh
-npx fork-friendly-actions --fix
-```
-
-To create one standalone file that can live anywhere on your `PATH`:
-
-```sh
-npm run build:standalone
-cp dist/ffactions ~/.local/bin/ffactions
-```
-
-After that, run it from any project checkout:
+Check workflows:
 
 ```sh
 ffactions
 ```
 
+Apply fixable changes:
+
+```sh
+ffactions --fix
+```
+
 Preview changes without writing files:
 
 ```sh
-npx fork-friendly-actions --fix --dry-run
+ffactions --fix --dry-run
 ```
 
 Review each proposed fix interactively and accept or skip it with `y`/`n`:
 
 ```sh
-npx fork-friendly-actions --interactive
+ffactions --interactive
 ```
 
 Pass the full upstream repository explicitly when the checkout has no usable git
 remotes or when you want to override detection:
 
 ```sh
-npx fork-friendly-actions --fix --upstream-repo ExampleOrg/example-repo
+ffactions --fix --upstream-repo ExampleOrg/example-repo
 ```
 
 Pass only the owner when no repo slug is available:
 
 ```sh
-npx fork-friendly-actions --fix --upstream-owner ExampleOrg
+ffactions --fix --upstream-owner ExampleOrg
 ```
 
 Use a different public fallback runner:
 
 ```sh
-npx fork-friendly-actions --fix --runner-fallback ubuntu-22.04-arm
+ffactions --fix --runner-fallback ubuntu-22.04-arm
 ```
 
 Run against a specific directory (defaults to current directory):
 
 ```sh
-npx fork-friendly-actions path/to/project
+ffactions path/to/project
 ```
 
 Refresh the committed public-runner list from GitHub Docs:
