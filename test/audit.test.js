@@ -20,11 +20,14 @@ const {
 } = require("../src/index.js");
 const {
   detectRepoSlugFromGit,
+  buildInteractiveBuffer,
   main,
+  parseInteractiveAction,
   parseArgs,
   parseInteractiveChoice,
   parseOwnerFromRemote,
   parseRepoSlugFromRemote,
+  readInteractiveChoice,
   runInteractiveFix,
 } = require("../bin/fork-friendly-actions.js");
 
@@ -1075,6 +1078,70 @@ test("parses interactive keypress choices", () => {
   assert.equal(parseInteractiveChoice("\u001b"), "quit");
   assert.equal(parseInteractiveChoice("\u0003"), "quit");
   assert.equal(parseInteractiveChoice("x"), "");
+});
+
+test("parses interactive reviewer navigation keys", () => {
+  assert.equal(parseInteractiveAction("j"), "scroll-down");
+  assert.equal(parseInteractiveAction("k"), "scroll-up");
+  assert.equal(parseInteractiveAction("\u001b[B"), "scroll-down");
+  assert.equal(parseInteractiveAction("\u001b[A"), "scroll-up");
+  assert.equal(parseInteractiveAction("\u001b[6~"), "page-down");
+  assert.equal(parseInteractiveAction("\u001b[5~"), "page-up");
+});
+
+test("interactive choice reader retries EAGAIN reads", () => {
+  let attempts = 0;
+  const sleeps = [];
+
+  const choice = readInteractiveChoice({
+    stdin: {
+      fd: 0,
+      isTTY: true,
+      isRaw: false,
+      setRawMode() {},
+      resume() {},
+      pause() {},
+    },
+    stdout: { write() {} },
+    readSync(_fd, buffer) {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error("resource temporarily unavailable");
+        error.code = "EAGAIN";
+        throw error;
+      }
+      buffer.write("y", 0, "utf8");
+      return 1;
+    },
+    sleep(durationMs) {
+      sleeps.push(durationMs);
+    },
+  });
+
+  assert.equal(choice, "apply");
+  assert.equal(attempts, 2);
+  assert.deepEqual(sleeps, [10]);
+});
+
+test("builds interactive buffers with inline selected diff lines", () => {
+  const preview = buildInteractiveBuffer(
+    ["name: CI", "jobs:", "  test:", "    runs-on: benchmark", "    steps:"],
+    {
+      start: 3,
+      end: 4,
+      replacement: ["    runs-on: ${{ github.repository_owner == 'ExampleOrg' && 'benchmark' || 'ubuntu-latest' }}"],
+    }
+  );
+
+  assert.equal(preview.selectedStart, 3);
+  assert.equal(preview.selectedEnd, 4);
+  assert.deepEqual(
+    preview.lines.slice(3, 5).map((line) => ({ type: line.type, selected: line.selected, marker: line.marker })),
+    [
+      { type: "delete", selected: true, marker: "-" },
+      { type: "add", selected: true, marker: "+" },
+    ]
+  );
 });
 
 test("rule codes use stable FFxxx identifiers", () => {

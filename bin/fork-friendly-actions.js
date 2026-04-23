@@ -194,46 +194,80 @@ function runInteractiveFix(result, { cwd, stdin = process.stdin, stdout = proces
     return { appliedChanges: 0, changedFiles: 0, skippedChanges: 0, quit: false };
   }
 
-  console.log(
-    `Interactive fix mode: ${interactiveChanges.length} proposed change${interactiveChanges.length === 1 ? "" : "s"} across ${result.editPlans.length} file${result.editPlans.length === 1 ? "" : "s"}.`
-  );
-  console.log("Keys: y apply, n skip, q quit, Esc quit, Ctrl+C quit.");
-  console.log("");
-
   const acceptedEditsByFile = new Map();
   let skippedChanges = 0;
   let quit = false;
   let reviewedChanges = 0;
+  let currentScrollTop = 0;
 
-  for (let index = 0; index < interactiveChanges.length; index += 1) {
-    const interactiveChange = interactiveChanges[index];
-    printInteractiveChange(interactiveChange, { index: index + 1, total: interactiveChanges.length });
-    stdout.write(paint("yellow", "Apply this change? [y/n/q] "));
+  enterInteractiveScreen(stdout);
+  try {
+    for (let index = 0; index < interactiveChanges.length; index += 1) {
+      const interactiveChange = interactiveChanges[index];
+      const priorAcceptedEdits = acceptedEditsByFile.get(interactiveChange.plan.file) || [];
+      currentScrollTop = initialScrollTopForInteractiveChange(interactiveChange, priorAcceptedEdits, stdout);
 
-    const choice = readChoice({ stdin, stdout });
-    if (choice === "apply") {
-      const accepted = acceptedEditsByFile.get(interactiveChange.plan.file) || [];
-      accepted.push(interactiveChange.edit);
-      acceptedEditsByFile.set(interactiveChange.plan.file, accepted);
-      reviewedChanges += 1;
-      console.log(paint("green", "Accepted."));
-      console.log("");
-      continue;
+      while (true) {
+        const preview = buildInteractivePreview(interactiveChange, priorAcceptedEdits);
+        currentScrollTop = clampInteractiveScrollTop(currentScrollTop, preview.lines.length, interactiveViewportHeight(stdout));
+        renderInteractiveScreen({
+          stdout,
+          interactiveChange,
+          preview,
+          index: index + 1,
+          total: interactiveChanges.length,
+          fileCount: result.editPlans.length,
+          acceptedCount: reviewedChanges - skippedChanges,
+          skippedCount: skippedChanges,
+          scrollTop: currentScrollTop,
+        });
+
+        const choice = readChoice({ stdin, stdout });
+        if (choice === "apply") {
+          const accepted = acceptedEditsByFile.get(interactiveChange.plan.file) || [];
+          accepted.push(interactiveChange.edit);
+          acceptedEditsByFile.set(interactiveChange.plan.file, accepted);
+          reviewedChanges += 1;
+          break;
+        }
+
+        if (choice === "skip") {
+          reviewedChanges += 1;
+          skippedChanges += 1;
+          break;
+        }
+
+        if (choice === "scroll-down") {
+          currentScrollTop += 1;
+          continue;
+        }
+
+        if (choice === "scroll-up") {
+          currentScrollTop -= 1;
+          continue;
+        }
+
+        if (choice === "page-down") {
+          currentScrollTop += Math.max(interactiveViewportHeight(stdout) - 2, 1);
+          continue;
+        }
+
+        if (choice === "page-up") {
+          currentScrollTop -= Math.max(interactiveViewportHeight(stdout) - 2, 1);
+          continue;
+        }
+
+        quit = true;
+        skippedChanges += interactiveChanges.length - index;
+        break;
+      }
+
+      if (quit) {
+        break;
+      }
     }
-
-    if (choice === "skip") {
-      reviewedChanges += 1;
-      skippedChanges += 1;
-      console.log(paint("gray", "Skipped."));
-      console.log("");
-      continue;
-    }
-
-    quit = true;
-    skippedChanges += interactiveChanges.length - index;
-    console.log(paint("gray", "Stopped interactive mode."));
-    console.log("");
-    break;
+  } finally {
+    leaveInteractiveScreen(stdout);
   }
 
   const applied = applyAcceptedInteractiveChanges(result.editPlans || [], acceptedEditsByFile);
@@ -269,39 +303,211 @@ function flattenInteractiveChanges(editPlans) {
   return changes;
 }
 
-function printInteractiveChange(interactiveChange, { index, total }) {
-  const { plan, edit } = interactiveChange;
-  console.log(paint("yellow", `[${index}/${total}] ${edit.title}`));
-  console.log(`${paint("cyan", `${plan.file}:${edit.start + 1}`)}`);
-  console.log(renderInteractiveEditPreview(plan.originalSource, edit));
+function buildInteractivePreview(interactiveChange, acceptedEdits) {
+  const sourceLines = String(interactiveChange.plan.originalSource).split(/\r?\n/);
+  const appliedLines = acceptedEdits.length > 0 ? applyEdits(sourceLines, acceptedEdits) : sourceLines;
+  const translatedEdit = translateInteractiveEdit(interactiveChange.edit, acceptedEdits);
+  return {
+    ...buildInteractiveBuffer(appliedLines, translatedEdit),
+    edit: translatedEdit,
+  };
 }
 
-function renderInteractiveEditPreview(source, edit, contextLines = 1) {
-  const lines = String(source).split(/\r?\n/);
+function translateInteractiveEdit(edit, acceptedEdits) {
+  let start = edit.start;
+  let end = edit.end;
+
+  for (const acceptedEdit of [...acceptedEdits].sort((left, right) => left.start - right.start)) {
+    const delta = acceptedEdit.replacement.length - (acceptedEdit.end - acceptedEdit.start);
+    if (acceptedEdit.start <= start) {
+      start += delta;
+    }
+    if (acceptedEdit.start < end || (acceptedEdit.start === end && acceptedEdit.end === acceptedEdit.start)) {
+      end += delta;
+    }
+  }
+
+  return {
+    ...edit,
+    start,
+    end,
+  };
+}
+
+function buildInteractiveBuffer(lines, edit) {
   const start = Math.max(edit.start, 0);
   const end = Math.max(edit.end, start);
-  const contextStart = Math.max(0, start - contextLines);
-  const contextEnd = Math.min(lines.length, end + contextLines);
-  const width = String(Math.max(contextEnd, start + Math.max(edit.replacement.length, 1))).length;
+  const width = String(lines.length || 1).length;
+  const bufferLines = [];
+  let selectedStart = 0;
+  let selectedEnd = 0;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (index === start) {
+      selectedStart = bufferLines.length;
+      for (let removeIndex = start; removeIndex < end; removeIndex += 1) {
+        bufferLines.push({
+          type: "delete",
+          selected: true,
+          marker: "-",
+          lineNumber: removeIndex + 1,
+          text: lines[removeIndex] || "",
+        });
+      }
+      for (const replacementLine of edit.replacement) {
+        bufferLines.push({
+          type: "add",
+          selected: true,
+          marker: "+",
+          lineNumber: "",
+          text: replacementLine,
+        });
+      }
+      selectedEnd = Math.max(bufferLines.length - 1, selectedStart);
+      index = Math.max(end - 1, index);
+      if (end > start) {
+        continue;
+      }
+    }
+
+    bufferLines.push({
+      type: "context",
+      selected: false,
+      marker: " ",
+      lineNumber: index + 1,
+      text: lines[index] || "",
+    });
+  }
+
+  if (start === lines.length) {
+    selectedStart = bufferLines.length;
+    for (const replacementLine of edit.replacement) {
+      bufferLines.push({
+        type: "add",
+        selected: true,
+        marker: "+",
+        lineNumber: "",
+        text: replacementLine,
+      });
+    }
+    selectedEnd = Math.max(bufferLines.length - 1, selectedStart);
+  }
+
+  if (bufferLines.length === 0) {
+    bufferLines.push({
+      type: "context",
+      selected: false,
+      marker: " ",
+      lineNumber: "",
+      text: "",
+    });
+  }
+
+  return {
+    width,
+    lines: bufferLines,
+    selectedStart,
+    selectedEnd,
+  };
+}
+
+function initialScrollTopForInteractiveChange(interactiveChange, acceptedEdits, stdout) {
+  const preview = buildInteractivePreview(interactiveChange, acceptedEdits);
+  const viewportHeight = interactiveViewportHeight(stdout);
+  const center = Math.max(Math.floor((preview.selectedStart + preview.selectedEnd) / 2), 0);
+  return clampInteractiveScrollTop(center - Math.floor(viewportHeight / 3), preview.lines.length, viewportHeight);
+}
+
+function clampInteractiveScrollTop(scrollTop, totalLines, viewportHeight) {
+  const maxScrollTop = Math.max(totalLines - viewportHeight, 0);
+  return Math.max(0, Math.min(scrollTop, maxScrollTop));
+}
+
+function interactiveViewportHeight(stdout) {
+  const { rows } = terminalSize(stdout);
+  return Math.max(rows - 6, 5);
+}
+
+function renderInteractiveScreen({ stdout, interactiveChange, preview, index, total, fileCount, acceptedCount, skippedCount, scrollTop }) {
+  const { columns, rows } = terminalSize(stdout);
+  const headerLines = [
+    `Interactive fix mode: ${total} proposed change${total === 1 ? "" : "s"} across ${fileCount} file${fileCount === 1 ? "" : "s"}.`,
+    `[${index}/${total}] ${interactiveChange.edit.title}`,
+    `${interactiveChange.plan.file}:${preview.edit.start + 1}  accepted ${acceptedCount}  skipped ${skippedCount}`,
+  ];
+  const footerLines = [
+    "y apply  n skip  q quit  j/k or arrows scroll  PgUp/PgDn page",
+    `Lines ${Math.min(scrollTop + 1, preview.lines.length)}-${Math.min(scrollTop + interactiveViewportHeight(stdout), preview.lines.length)} of ${preview.lines.length}`,
+  ];
+  const bodyHeight = Math.max(rows - headerLines.length - footerLines.length - 1, 5);
+  const visibleLines = preview.lines.slice(scrollTop, scrollTop + bodyHeight);
+
   const output = [];
+  output.push("\u001b[H\u001b[2J");
+  output.push(paint("yellow", truncateLine(headerLines[0], columns)));
+  output.push(paint("yellow", truncateLine(headerLines[1], columns)));
+  output.push(paint("cyan", truncateLine(headerLines[2], columns)));
+  output.push(paint("gray", truncateLine("─".repeat(Math.max(columns, 1)), columns)));
 
-  for (let index = contextStart; index < start; index += 1) {
-    output.push(`  ${String(index + 1).padStart(width)} | ${lines[index] || ""}`);
+  for (const line of visibleLines) {
+    output.push(renderInteractiveBufferLine(line, preview.width, columns));
   }
-  for (let index = start; index < end; index += 1) {
-    output.push(paint("red", `- ${String(index + 1).padStart(width)} | ${lines[index] || ""}`));
-  }
-  if (edit.replacement.length === 0 && start === end) {
-    output.push(paint("red", `- ${String(start + 1).padStart(width)} | `));
-  }
-  for (const replacementLine of edit.replacement) {
-    output.push(paint("green", `+ ${" ".repeat(width)} | ${replacementLine}`));
-  }
-  for (let index = end; index < contextEnd; index += 1) {
-    output.push(`  ${String(index + 1).padStart(width)} | ${lines[index] || ""}`);
+  for (let index = visibleLines.length; index < bodyHeight; index += 1) {
+    output.push("");
   }
 
-  return output.join("\n");
+  output.push(paint("gray", truncateLine("─".repeat(Math.max(columns, 1)), columns)));
+  output.push(paint("gray", truncateLine(footerLines[0], columns)));
+  output.push(paint("gray", truncateLine(footerLines[1], columns)));
+
+  stdout.write(output.join("\n"));
+}
+
+function renderInteractiveBufferLine(line, width, columns) {
+  const selectionMarker = line.selected ? ">" : " ";
+  const lineNumber = line.lineNumber === "" ? " ".repeat(width) : String(line.lineNumber).padStart(width);
+  const rendered = `${selectionMarker}${line.marker} ${lineNumber} | ${line.text}`;
+  const truncated = truncateLine(rendered, columns);
+
+  if (line.selected && line.type === "add") {
+    return paintStyle("selectedAdd", truncated);
+  }
+  if (line.selected && line.type === "delete") {
+    return paintStyle("selectedDelete", truncated);
+  }
+  if (line.selected) {
+    return paintStyle("selected", truncated);
+  }
+  if (line.type === "add") {
+    return paint("green", truncated);
+  }
+  if (line.type === "delete") {
+    return paint("red", truncated);
+  }
+  return truncated;
+}
+
+function truncateLine(text, columns) {
+  const width = Math.max(columns || 80, 20);
+  if (text.length <= width) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(width - 1, 1))}…`;
+}
+
+function terminalSize(stdout) {
+  return {
+    columns: Math.max(Number(stdout.columns) || 100, 40),
+    rows: Math.max(Number(stdout.rows) || 30, 12),
+  };
+}
+
+function enterInteractiveScreen(stdout) {
+  stdout.write("\u001b[?1049h\u001b[?25l");
+}
+
+function leaveInteractiveScreen(stdout) {
+  stdout.write("\u001b[?25h\u001b[?1049l");
 }
 
 function applyAcceptedInteractiveChanges(editPlans, acceptedEditsByFile) {
@@ -335,7 +541,7 @@ function applyEdits(lines, edits) {
   return fixed;
 }
 
-function readInteractiveChoice({ stdin = process.stdin, stdout = process.stdout } = {}) {
+function readInteractiveChoice({ stdin = process.stdin, stdout = process.stdout, readSync = fs.readSync, sleep = sleepMs } = {}) {
   const buffer = Buffer.alloc(16);
   const wasRaw = Boolean(stdin.isRaw);
 
@@ -344,17 +550,25 @@ function readInteractiveChoice({ stdin = process.stdin, stdout = process.stdout 
     stdin.resume();
 
     while (true) {
-      const bytesRead = fs.readSync(stdin.fd, buffer, 0, buffer.length, null);
+      let bytesRead = 0;
+      try {
+        bytesRead = readSync(stdin.fd, buffer, 0, buffer.length, null);
+      } catch (error) {
+        if (isRetryableReadError(error)) {
+          sleep(10);
+          continue;
+        }
+        throw error;
+      }
       if (bytesRead <= 0) {
+        sleep(10);
         continue;
       }
 
-      const choice = parseInteractiveChoice(buffer.subarray(0, bytesRead));
+      const choice = parseInteractiveAction(buffer.subarray(0, bytesRead));
       if (!choice) {
         continue;
       }
-
-      stdout.write("\n");
       return choice;
     }
   } finally {
@@ -363,6 +577,21 @@ function readInteractiveChoice({ stdin = process.stdin, stdout = process.stdout 
       stdin.pause();
     }
   }
+}
+
+function isRetryableReadError(error) {
+  return Boolean(error && ["EAGAIN", "EWOULDBLOCK", "EINTR"].includes(error.code));
+}
+
+function sleepMs(durationMs) {
+  const timeout = Math.max(0, Number(durationMs) || 0);
+  if (timeout === 0) {
+    return;
+  }
+
+  const shared = new SharedArrayBuffer(4);
+  const state = new Int32Array(shared);
+  Atomics.wait(state, 0, 0, timeout);
 }
 
 function parseInteractiveChoice(input) {
@@ -379,6 +608,23 @@ function parseInteractiveChoice(input) {
     return "quit";
   }
   return "";
+}
+
+function parseInteractiveAction(input) {
+  const text = Buffer.isBuffer(input) ? input.toString("utf8") : String(input || "");
+  if (text === "j" || text === "\u001b[B") {
+    return "scroll-down";
+  }
+  if (text === "k" || text === "\u001b[A") {
+    return "scroll-up";
+  }
+  if (text === "\u001b[6~") {
+    return "page-down";
+  }
+  if (text === "\u001b[5~") {
+    return "page-up";
+  }
+  return parseInteractiveChoice(text);
 }
 
 function printResult(result, { fixMode, cwd, dryRun }) {
@@ -764,6 +1010,20 @@ function paint(color, text) {
   return `${codes[color] || ""}${text}\u001b[0m`;
 }
 
+function paintStyle(style, text) {
+  if (!supportsColor()) {
+    return text;
+  }
+
+  const codes = {
+    selected: "\u001b[7m",
+    selectedAdd: "\u001b[1;30;102m",
+    selectedDelete: "\u001b[1;37;41m",
+  };
+
+  return `${codes[style] || ""}${text}\u001b[0m`;
+}
+
 function printHelp() {
   console.log(`fork-friendly-actions
 
@@ -804,9 +1064,12 @@ if (require.main === module) {
 
 module.exports = {
   applyAcceptedInteractiveChanges,
+  buildInteractiveBuffer,
   detectRepoSlugFromGit,
   main,
+  parseInteractiveAction,
   parseInteractiveChoice,
+  readInteractiveChoice,
   parseArgs,
   parseOwnerFromRemote,
   parseRepoSlugFromRemote,
