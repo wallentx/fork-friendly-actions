@@ -22,7 +22,8 @@ function main(argv) {
   }
 
   const cwd = path.resolve(parsed.cwd || process.cwd());
-  const fixMode = Boolean(parsed.fix);
+  const interactiveMode = Boolean(parsed.interactive);
+  const fixMode = Boolean(parsed.fix || interactiveMode);
   const upstreamRepo = parsed.upstreamRepo || detectRepoSlugFromGit(cwd);
   const upstreamOwner = parsed.upstreamOwner || ownerFromRepoSlug(upstreamRepo);
 
@@ -40,10 +41,14 @@ function main(argv) {
   };
 
   const result = fixMode
-    ? fixWorkflows({ ...options, dryRun: parsed.dryRun })
+    ? fixWorkflows({ ...options, dryRun: parsed.dryRun || interactiveMode })
     : auditWorkflows(options);
 
-  printResult(result, { fixMode, cwd, dryRun: parsed.dryRun });
+  if (interactiveMode) {
+    runInteractiveFix(result, { cwd });
+  } else {
+    printResult(result, { fixMode, cwd, dryRun: parsed.dryRun });
+  }
 
   const failOn = parsed.failOn || (fixMode ? "none" : "error");
   return shouldFail(result.findings, failOn) ? 1 : 0;
@@ -67,6 +72,11 @@ function parseArgs(argv) {
         break;
       case "--fix":
       case "-f":
+        parsed.fix = true;
+        break;
+      case "--interactive":
+      case "-i":
+        parsed.interactive = true;
         parsed.fix = true;
         break;
       case "--workflows":
@@ -103,6 +113,10 @@ function parseArgs(argv) {
           throw new Error(`Unknown option: ${arg}`);
         }
     }
+  }
+
+  if (parsed.interactive && parsed.dryRun) {
+    throw new Error("--interactive cannot be combined with --dry-run.");
   }
 
   return parsed;
@@ -156,6 +170,215 @@ function parseRepoSlugFromRemote(remote) {
 
 function parseOwnerFromRemote(remote) {
   return ownerFromRepoSlug(parseRepoSlugFromRemote(remote));
+}
+
+function runInteractiveFix(result, { cwd, stdin = process.stdin, stdout = process.stdout, readChoice = readInteractiveChoice } = {}) {
+  if (result.files.length === 0) {
+    console.log("No workflow files found.");
+    return { appliedChanges: 0, changedFiles: 0, skippedChanges: 0, quit: false };
+  }
+
+  if (result.findings.length === 0) {
+    console.log(`ffactions: no issues found (checked ${result.files.length} workflow file${result.files.length === 1 ? "" : "s"})`);
+    return { appliedChanges: 0, changedFiles: 0, skippedChanges: 0, quit: false };
+  }
+
+  if (!stdin.isTTY || typeof stdin.setRawMode !== "function") {
+    throw new Error("Interactive mode requires a TTY.");
+  }
+
+  const interactiveChanges = flattenInteractiveChanges(result.editPlans || []);
+  if (interactiveChanges.length === 0) {
+    printResult(result, { fixMode: true, cwd, dryRun: false });
+    console.log("No fixable changes are available for interactive mode.");
+    return { appliedChanges: 0, changedFiles: 0, skippedChanges: 0, quit: false };
+  }
+
+  console.log(
+    `Interactive fix mode: ${interactiveChanges.length} proposed change${interactiveChanges.length === 1 ? "" : "s"} across ${result.editPlans.length} file${result.editPlans.length === 1 ? "" : "s"}.`
+  );
+  console.log("Keys: y apply, n skip, q quit, Esc quit, Ctrl+C quit.");
+  console.log("");
+
+  const acceptedEditsByFile = new Map();
+  let skippedChanges = 0;
+  let quit = false;
+  let reviewedChanges = 0;
+
+  for (let index = 0; index < interactiveChanges.length; index += 1) {
+    const interactiveChange = interactiveChanges[index];
+    printInteractiveChange(interactiveChange, { index: index + 1, total: interactiveChanges.length });
+    stdout.write(paint("yellow", "Apply this change? [y/n/q] "));
+
+    const choice = readChoice({ stdin, stdout });
+    if (choice === "apply") {
+      const accepted = acceptedEditsByFile.get(interactiveChange.plan.file) || [];
+      accepted.push(interactiveChange.edit);
+      acceptedEditsByFile.set(interactiveChange.plan.file, accepted);
+      reviewedChanges += 1;
+      console.log(paint("green", "Accepted."));
+      console.log("");
+      continue;
+    }
+
+    if (choice === "skip") {
+      reviewedChanges += 1;
+      skippedChanges += 1;
+      console.log(paint("gray", "Skipped."));
+      console.log("");
+      continue;
+    }
+
+    quit = true;
+    skippedChanges += interactiveChanges.length - index;
+    console.log(paint("gray", "Stopped interactive mode."));
+    console.log("");
+    break;
+  }
+
+  const applied = applyAcceptedInteractiveChanges(result.editPlans || [], acceptedEditsByFile);
+  if (applied.appliedChanges === 0) {
+    console.log("No changes applied.");
+  } else {
+    console.log(
+      `Applied ${applied.appliedChanges} accepted change${applied.appliedChanges === 1 ? "" : "s"} across ${applied.changedFiles} file${applied.changedFiles === 1 ? "" : "s"}.`
+    );
+  }
+  if (quit && interactiveChanges.length - reviewedChanges > 0) {
+    const remainingChanges = interactiveChanges.length - reviewedChanges;
+    console.log(`Stopped with ${remainingChanges} change${remainingChanges === 1 ? "" : "s"} left unreviewed.`);
+  } else if (skippedChanges > 0) {
+    console.log(`Skipped ${skippedChanges} change${skippedChanges === 1 ? "" : "s"}.`);
+  }
+
+  return {
+    appliedChanges: applied.appliedChanges,
+    changedFiles: applied.changedFiles,
+    skippedChanges,
+    quit,
+  };
+}
+
+function flattenInteractiveChanges(editPlans) {
+  const changes = [];
+  for (const plan of editPlans) {
+    for (const edit of plan.edits || []) {
+      changes.push({ plan, edit });
+    }
+  }
+  return changes;
+}
+
+function printInteractiveChange(interactiveChange, { index, total }) {
+  const { plan, edit } = interactiveChange;
+  console.log(paint("yellow", `[${index}/${total}] ${edit.title}`));
+  console.log(`${paint("cyan", `${plan.file}:${edit.start + 1}`)}`);
+  console.log(renderInteractiveEditPreview(plan.originalSource, edit));
+}
+
+function renderInteractiveEditPreview(source, edit, contextLines = 1) {
+  const lines = String(source).split(/\r?\n/);
+  const start = Math.max(edit.start, 0);
+  const end = Math.max(edit.end, start);
+  const contextStart = Math.max(0, start - contextLines);
+  const contextEnd = Math.min(lines.length, end + contextLines);
+  const width = String(Math.max(contextEnd, start + Math.max(edit.replacement.length, 1))).length;
+  const output = [];
+
+  for (let index = contextStart; index < start; index += 1) {
+    output.push(`  ${String(index + 1).padStart(width)} | ${lines[index] || ""}`);
+  }
+  for (let index = start; index < end; index += 1) {
+    output.push(paint("red", `- ${String(index + 1).padStart(width)} | ${lines[index] || ""}`));
+  }
+  if (edit.replacement.length === 0 && start === end) {
+    output.push(paint("red", `- ${String(start + 1).padStart(width)} | `));
+  }
+  for (const replacementLine of edit.replacement) {
+    output.push(paint("green", `+ ${" ".repeat(width)} | ${replacementLine}`));
+  }
+  for (let index = end; index < contextEnd; index += 1) {
+    output.push(`  ${String(index + 1).padStart(width)} | ${lines[index] || ""}`);
+  }
+
+  return output.join("\n");
+}
+
+function applyAcceptedInteractiveChanges(editPlans, acceptedEditsByFile) {
+  let appliedChanges = 0;
+  let changedFiles = 0;
+
+  for (const plan of editPlans) {
+    const acceptedEdits = acceptedEditsByFile.get(plan.file) || [];
+    if (acceptedEdits.length === 0) {
+      continue;
+    }
+
+    const lines = String(plan.originalSource).split(/\r?\n/);
+    const fixedLines = applyEdits(lines, acceptedEdits);
+    fs.writeFileSync(plan.filePath, fixedLines.join(plan.lineEnding));
+    appliedChanges += acceptedEdits.length;
+    changedFiles += 1;
+  }
+
+  return {
+    appliedChanges,
+    changedFiles,
+  };
+}
+
+function applyEdits(lines, edits) {
+  const fixed = [...lines];
+  for (const edit of [...edits].sort((left, right) => right.start - left.start)) {
+    fixed.splice(edit.start, edit.end - edit.start, ...edit.replacement);
+  }
+  return fixed;
+}
+
+function readInteractiveChoice({ stdin = process.stdin, stdout = process.stdout } = {}) {
+  const buffer = Buffer.alloc(16);
+  const wasRaw = Boolean(stdin.isRaw);
+
+  try {
+    stdin.setRawMode(true);
+    stdin.resume();
+
+    while (true) {
+      const bytesRead = fs.readSync(stdin.fd, buffer, 0, buffer.length, null);
+      if (bytesRead <= 0) {
+        continue;
+      }
+
+      const choice = parseInteractiveChoice(buffer.subarray(0, bytesRead));
+      if (!choice) {
+        continue;
+      }
+
+      stdout.write("\n");
+      return choice;
+    }
+  } finally {
+    stdin.setRawMode(wasRaw);
+    if (!wasRaw) {
+      stdin.pause();
+    }
+  }
+}
+
+function parseInteractiveChoice(input) {
+  const text = Buffer.isBuffer(input) ? input.toString("utf8") : String(input || "");
+  const first = text[0] ? text[0].toLowerCase() : "";
+
+  if (first === "y") {
+    return "apply";
+  }
+  if (first === "n") {
+    return "skip";
+  }
+  if (first === "q" || first === "\u001b" || first === "\u0003") {
+    return "quit";
+  }
+  return "";
 }
 
 function printResult(result, { fixMode, cwd, dryRun }) {
@@ -555,6 +778,7 @@ Default upstream scope detection:
 
 Options:
   -f, --fix                   Evaluate workflows and rewrite fixable fork-hostile patterns.
+  -i, --interactive           Review each proposed fix interactively and apply accepted changes.
   -w, --workflows <path>      Workflow file or directory. Default: ${DEFAULT_WORKFLOWS_DIR}
   -r, --upstream-repo <slug>  Override the detected upstream repository slug for fork gating.
   -o, --upstream-owner <name> Override the detected upstream owner when no repo slug is available.
@@ -579,9 +803,12 @@ if (require.main === module) {
 }
 
 module.exports = {
+  applyAcceptedInteractiveChanges,
   detectRepoSlugFromGit,
   main,
+  parseInteractiveChoice,
   parseArgs,
   parseOwnerFromRemote,
   parseRepoSlugFromRemote,
+  runInteractiveFix,
 };

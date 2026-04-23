@@ -10,6 +10,7 @@ const {
   RULES,
   auditWorkflowFile,
   buildUpstreamGuardExpression,
+  fixWorkflows,
   fixWorkflowFile,
   loadPublicGithubHostedRunners,
   normalizeUpstreamScope,
@@ -17,7 +18,15 @@ const {
   parseRunnerLabels,
   shouldFail,
 } = require("../src/index.js");
-const { detectRepoSlugFromGit, parseArgs, parseOwnerFromRemote, parseRepoSlugFromRemote } = require("../bin/fork-friendly-actions.js");
+const {
+  detectRepoSlugFromGit,
+  main,
+  parseArgs,
+  parseInteractiveChoice,
+  parseOwnerFromRemote,
+  parseRepoSlugFromRemote,
+  runInteractiveFix,
+} = require("../bin/fork-friendly-actions.js");
 
 function audit(source) {
   return auditWorkflowFile({
@@ -26,6 +35,37 @@ function audit(source) {
     cwd: "/repo",
     allowList: new Set(),
   });
+}
+
+function runCli(args, env = {}) {
+  const originalLog = console.log;
+  const originalError = console.error;
+  const originalEnv = { ...process.env };
+  const stdout = [];
+  const stderr = [];
+
+  console.log = (...parts) => stdout.push(parts.join(" "));
+  console.error = (...parts) => stderr.push(parts.join(" "));
+  Object.assign(process.env, env);
+
+  try {
+    const status = main(args);
+    return {
+      status,
+      stdout: stdout.join("\n"),
+      stderr: stderr.join("\n"),
+    };
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, originalEnv);
+  }
 }
 
 test("parses inline runner arrays", () => {
@@ -1013,6 +1053,8 @@ test("derives owner and guard expressions from upstream repo scope", () => {
 test("parses short aliases and positional path", () => {
   assert.equal(parseArgs(["--fix"]).fix, true);
   assert.equal(parseArgs(["-f"]).fix, true);
+  assert.equal(parseArgs(["--interactive"]).interactive, true);
+  assert.equal(parseArgs(["-i"]).interactive, true);
   assert.equal(parseArgs(["-r", "openai/codex"]).upstreamRepo, "openai/codex");
   assert.equal(parseArgs(["-w", "some/path"]).workflows, "some/path");
   assert.equal(parseArgs(["-d"]).dryRun, true);
@@ -1022,6 +1064,17 @@ test("parses short aliases and positional path", () => {
   assert.equal(parseArgs(["-l", "none"]).failOn, "none");
   assert.equal(parseArgs(["my/path"]).cwd, "my/path");
   assert.equal(parseArgs(["-f", "my/path"]).cwd, "my/path");
+  assert.throws(() => parseArgs(["-i", "-d"]), /cannot be combined/);
+});
+
+test("parses interactive keypress choices", () => {
+  assert.equal(parseInteractiveChoice("y"), "apply");
+  assert.equal(parseInteractiveChoice("Y"), "apply");
+  assert.equal(parseInteractiveChoice("n"), "skip");
+  assert.equal(parseInteractiveChoice("q"), "quit");
+  assert.equal(parseInteractiveChoice("\u001b"), "quit");
+  assert.equal(parseInteractiveChoice("\u0003"), "quit");
+  assert.equal(parseInteractiveChoice("x"), "");
 });
 
 test("rule codes use stable FFxxx identifiers", () => {
@@ -1046,11 +1099,7 @@ jobs:
 `;
   fs.writeFileSync(workflowPath, original);
 
-  const result = childProcess.spawnSync(process.execPath, ["bin/fork-friendly-actions.js", tmpDir, "-o", "ExampleOrg"], {
-    cwd: path.resolve(__dirname, ".."),
-    encoding: "utf8",
-    env: { ...process.env, NO_COLOR: "1" },
-  });
+  const result = runCli([tmpDir, "-o", "ExampleOrg"], { NO_COLOR: "1" });
 
   assert.equal(result.status, 1);
   assert.match(result.stdout, /FF001 runner-label: Private runner is not fork-friendly/);
@@ -1078,16 +1127,54 @@ jobs:
 `
   );
 
-  const result = childProcess.spawnSync(process.execPath, ["bin/fork-friendly-actions.js", tmpDir, "-o", "ExampleOrg"], {
-    cwd: path.resolve(__dirname, ".."),
-    encoding: "utf8",
-    env: { ...process.env, NO_COLOR: "1" },
-  });
+  const result = runCli([tmpDir, "-o", "ExampleOrg"], { NO_COLOR: "1" });
 
   assert.equal(result.status, 0);
   assert.match(result.stdout, /FF003 secret-gate: Secret usage is not owner-gated/);
   assert.match(result.stdout, /- (?:✅|⚠️) \.github\/workflows\/reuse\.yml:6:5 \(secrets: inherit\)/);
   assert.match(result.stdout, /6 \|     secrets: inherit/);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("interactive mode applies accepted changes one edit at a time", () => {
+  const tmpDir = fs.mkdtempSync(path.join(process.cwd(), "tmp-ffactions-interactive-"));
+  const workflowsDir = path.join(tmpDir, ".github", "workflows");
+  fs.mkdirSync(workflowsDir, { recursive: true });
+  const workflowPath = path.join(workflowsDir, "ci.yml");
+  fs.writeFileSync(
+    workflowPath,
+    `name: CI
+on: pull_request
+jobs:
+  publish:
+    runs-on: benchmark
+    steps:
+      - run: twine upload dist/*
+        env:
+          TWINE_PASSWORD: \${{ secrets.PYPI_TOKEN }}
+`
+  );
+
+  const result = fixWorkflows({
+    cwd: tmpDir,
+    upstreamOwner: "ExampleOrg",
+    dryRun: true,
+  });
+
+  const choices = ["apply", "skip"];
+  const summary = runInteractiveFix(result, {
+    cwd: tmpDir,
+    stdin: { isTTY: true, setRawMode() {}, resume() {}, pause() {} },
+    stdout: { write() {} },
+    readChoice() {
+      return choices.shift() || "quit";
+    },
+  });
+
+  const updated = fs.readFileSync(workflowPath, "utf8");
+  assert.equal(summary.appliedChanges, 1);
+  assert.match(updated, /runs-on: \$\{\{ github\.repository_owner == 'ExampleOrg' && 'benchmark' \|\| 'ubuntu-latest' \}\}/);
+  assert.doesNotMatch(updated, /if: github\.repository_owner == 'ExampleOrg'/);
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 

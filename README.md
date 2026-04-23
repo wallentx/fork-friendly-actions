@@ -58,6 +58,12 @@ Preview changes without writing files:
 npx fork-friendly-actions --fix --dry-run
 ```
 
+Review each proposed fix interactively and accept or skip it with `y`/`n`:
+
+```sh
+npx fork-friendly-actions --interactive
+```
+
 Pass the full upstream repository explicitly when the checkout has no usable git
 remotes or when you want to override detection:
 

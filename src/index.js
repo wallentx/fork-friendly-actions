@@ -209,6 +209,7 @@ function evaluateWorkflows({
   const findings = [];
   const changes = [];
   const fileChanges = [];
+  const editPlans = [];
 
   for (const filePath of files) {
     const source = fs.readFileSync(filePath, "utf8");
@@ -225,6 +226,17 @@ function evaluateWorkflows({
     findings.push(...result.findings);
     changes.push(...result.changes);
     if (mode === "fix" && result.fixedSource !== source) {
+      editPlans.push({
+        file: result.relativeFile || path.relative(cwd, filePath),
+        filePath,
+        originalSource: source,
+        fixedSource: result.fixedSource,
+        lineEnding: source.includes("\r\n") ? "\r\n" : "\n",
+        edits: result.edits.map((edit) => ({
+          ...edit,
+          file: result.relativeFile || path.relative(cwd, filePath),
+        })),
+      });
       fileChanges.push({
         file: result.changes[0]?.file || path.relative(cwd, filePath),
         originalSource: source,
@@ -241,6 +253,7 @@ function evaluateWorkflows({
     findings,
     changes,
     fileChanges,
+    editPlans,
     changedFiles: [...new Set(changes.map((change) => change.file))],
     summary: summarizeFindings(findings, changes),
   };
@@ -590,7 +603,15 @@ function evaluateWorkflowFile({
   const fixedLines = applyEdits(lines, normalizedEdits);
 
   return {
+    relativeFile,
     findings: dedupeFindings(findings),
+    edits: normalizedEdits.map((edit) => ({
+      start: edit.start,
+      end: edit.end,
+      title: edit.title,
+      replacement: edit.replacement,
+      key: edit.key,
+    })),
     changes: normalizedEdits.map((edit) => ({
       file: relativeFile,
       line: edit.start + 1,
