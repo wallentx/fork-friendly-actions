@@ -1,6 +1,11 @@
 # Local testing
 .test/
 
+# Local agent state
+.codex
+.codex/
+TODO.md
+
 # Logs
 logs
 *.log
@@ -83,7 +88,12 @@ out
 
 # Nuxt.js build / generate output
 .nuxt
-dist
+dist/*
+!dist/action/
+!dist/action/index.js
+!dist/action/licenses.txt
+!dist/data/
+!dist/data/public-github-hosted-runners.txt
 
 # Gatsby files
 .cache/

@@ -1,21 +1,25 @@
 {
-  "name": "fork-friendly-actions",
+  "name": "@wallentx/fork-friendly-actions",
   "version": "0.1.0",
   "description": "Evaluate and fix GitHub Actions workflows for fork-hostile CI patterns.",
   "type": "commonjs",
   "bin": {
+    "ffactions": "bin/fork-friendly-actions.js",
     "fork-friendly-actions": "bin/fork-friendly-actions.js"
   },
   "files": [
     "action.yml",
     "bin",
     "data",
+    "dist/action",
+    "dist/data",
     "src",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "npm run test && npm run build:standalone",
+    "build": "npm run test && npm run build:action && npm run build:standalone",
+    "build:action": "node scripts/build-action.js",
     "build:standalone": "node scripts/build-standalone.js",
     "update:public-runners": "sh scripts/update-public-github-hosted-runners.sh",
     "test": "node --test"
@@ -23,8 +27,18 @@
   "engines": {
     "node": ">=20"
   },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wallentx/fork-friendly-actions.git"
+  },
   "license": "MIT",
   "dependencies": {
     "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.38.4"
   }
 }

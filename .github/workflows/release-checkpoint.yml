@@ -1,0 +1,74 @@
+name: Release Checkpoint
+
+on:
+  push:
+    branches:
+      - "release/**"
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: Release branch to checkpoint from, for example release/v1.2.3
+        required: false
+        type: string
+        default: ""
+      source_sha:
+        description: Specific source commit SHA to checkpoint; defaults to the source branch tip
+        required: false
+        type: string
+        default: ""
+      destination_branch:
+        description: Destination branch to checkpoint into
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: write
+  actions: read
+  attestations: read
+  checks: read
+  deployments: read
+  discussions: read
+  issues: write
+  packages: read
+  pages: read
+  pull-requests: write
+  repository-projects: read
+  statuses: read
+
+concurrency:
+  group: release-checkpoint-${{ inputs.source_branch || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  checkpoint:
+    runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+      SOURCE_BRANCH: ${{ inputs.source_branch || github.ref_name }}
+      SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+      DESTINATION_BRANCH: ${{ inputs.destination_branch || 'main' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Actions Toolbox
+        env:
+          GH_TOKEN: ${{ github.token }}
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --prune origin "$DESTINATION_BRANCH" "$SOURCE_BRANCH"
+          if [ -z "$SOURCE_SHA" ]; then
+            echo "SOURCE_SHA=$(git rev-parse "origin/${SOURCE_BRANCH}")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Create checkpoint PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/create-checkpoint-pr.sh

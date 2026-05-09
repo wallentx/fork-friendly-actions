@@ -1,0 +1,108 @@
+name: Release Candidate
+
+on:
+  push:
+    branches:
+      - "release/**"
+
+permissions:
+  contents: write
+  actions: read
+  attestations: read
+  checks: read
+  deployments: read
+  discussions: read
+  issues: read
+  packages: write
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  statuses: read
+
+concurrency:
+  group: release-candidate-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish-rc:
+    if: github.repository == 'wallentx/fork-friendly-actions'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Actions Toolbox
+        env:
+          GH_TOKEN: ${{ github.token }}
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          registry-url: https://npm.pkg.github.com
+          cache: npm
+
+      - name: Resolve RC version
+        id: version
+        run: |
+          node scripts/resolve-release-version.js \
+            --mode rc \
+            --ref-name "$GITHUB_REF_NAME" \
+            --sha "$GITHUB_SHA" \
+            --run-number "$GITHUB_RUN_NUMBER"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set package version
+        run: npm version "${{ steps.version.outputs.npm-version }}" --no-git-tag-version --allow-same-version
+
+      - name: Build
+        run: npm run build
+
+      - name: Create release artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp dist/ffactions artifacts/ffactions
+          npm pack --pack-destination artifacts
+          sha256sum artifacts/* > artifacts/SHA256SUMS
+          {
+            echo "source_sha=${GITHUB_SHA}"
+            echo "source_ref=${GITHUB_REF_NAME}"
+            echo "npm_version=${{ steps.version.outputs.npm-version }}"
+            echo "tag_name=${{ steps.version.outputs.tag-name }}"
+            echo "release_tag=${{ steps.version.outputs.release-tag }}"
+            echo "npm_tag=${{ steps.version.outputs.npm-tag }}"
+            echo "workflow_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > artifacts/release-manifest.txt
+
+      - name: Publish package to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        run: npm publish --tag "${{ steps.version.outputs.npm-tag }}"
+
+      - name: Create or update prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag-name }}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            git tag -f "$tag" "$GITHUB_SHA"
+          else
+            git tag "$tag" "$GITHUB_SHA"
+          fi
+          git push origin "refs/tags/${tag}" --force
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/* --clobber
+          else
+            gh release create "$tag" artifacts/* \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "Fork Friendly Actions $tag" \
+              --notes "Release candidate for ${{ steps.version.outputs.release-tag }} from $GITHUB_REF_NAME."
+          fi

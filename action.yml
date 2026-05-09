@@ -43,7 +43,7 @@ outputs:
     description: Markdown summary of findings.
 runs:
   using: node20
-  main: src/action.js
+  main: dist/action/index.js
 branding:
   icon: git-pull-request
   color: green
