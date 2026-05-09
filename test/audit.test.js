@@ -22,6 +22,7 @@ const {
   detectRepoSlugFromGit,
   buildInteractiveBuffer,
   buildInteractiveLegendLines,
+  formatCliVersion,
   main,
   parseInteractiveAction,
   parseArgs,
@@ -29,6 +30,7 @@ const {
   parseOwnerFromRemote,
   parseRepoSlugFromRemote,
   readInteractiveChoice,
+  resolveCliVersion,
   resolveCliTarget,
   runInteractiveFix,
   wrapInteractiveBufferLine,
@@ -1109,6 +1111,8 @@ test("parses short aliases and positional path", () => {
   assert.equal(parseArgs(["-f"]).fix, true);
   assert.equal(parseArgs(["--interactive"]).interactive, true);
   assert.equal(parseArgs(["-i"]).interactive, true);
+  assert.equal(parseArgs(["--version"]).version, true);
+  assert.equal(parseArgs(["-v"]).version, true);
   assert.equal(parseArgs(["-r", "openai/codex"]).upstreamRepo, "openai/codex");
   assert.equal(parseArgs(["-w", "some/path"]).workflows, "some/path");
   assert.equal(parseArgs(["-d"]).dryRun, true);
@@ -1119,6 +1123,44 @@ test("parses short aliases and positional path", () => {
   assert.equal(parseArgs(["my/path"]).cwd, "my/path");
   assert.equal(parseArgs(["-f", "my/path"]).cwd, "my/path");
   assert.throws(() => parseArgs(["-i", "-d"]), /cannot be combined/);
+});
+
+test("formats CLI version with optional build SHA", () => {
+  assert.equal(formatCliVersion({ version: "1.2.3", buildSha: "" }), "1.2.3");
+  assert.equal(formatCliVersion({ version: "1.2.3", buildSha: "abcdef123456" }), "1.2.3+abcdef12");
+});
+
+test("prints CLI version without auditing workflows", () => {
+  const result = runCli(["--version"], {
+    FFACTIONS_VERSION: "1.2.3",
+    FFACTIONS_BUILD_SHA: "abcdef123456",
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, "1.2.3+abcdef12");
+  assert.equal(result.stderr, "");
+});
+
+test("resolves CLI version from environment override", () => {
+  const originalVersion = process.env.FFACTIONS_VERSION;
+  const originalBuildSha = process.env.FFACTIONS_BUILD_SHA;
+  process.env.FFACTIONS_VERSION = "2.0.0";
+  process.env.FFACTIONS_BUILD_SHA = "1234567890";
+
+  try {
+    assert.equal(resolveCliVersion(), "2.0.0+12345678");
+  } finally {
+    if (originalVersion == null) {
+      delete process.env.FFACTIONS_VERSION;
+    } else {
+      process.env.FFACTIONS_VERSION = originalVersion;
+    }
+    if (originalBuildSha == null) {
+      delete process.env.FFACTIONS_BUILD_SHA;
+    } else {
+      process.env.FFACTIONS_BUILD_SHA = originalBuildSha;
+    }
+  }
 });
 
 test("resolves positional workflow files relative to their containing directory", () => {

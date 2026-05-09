@@ -112,6 +112,12 @@ Check workflows:
 ffactions
 ```
 
+Show the installed version:
+
+```sh
+ffactions --version
+```
+
 Apply fixable changes:
 
 ```sh

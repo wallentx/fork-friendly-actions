@@ -4,11 +4,13 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const childProcess = require("node:child_process");
 
 const repoRoot = path.resolve(__dirname, "..");
 const corePath = path.join(repoRoot, "src", "index.js");
 const cliPath = path.join(repoRoot, "bin", "fork-friendly-actions.js");
 const dataPath = path.join(repoRoot, "data", "public-github-hosted-runners.txt");
+const packagePath = path.join(repoRoot, "package.json");
 const outputDir = path.join(repoRoot, "dist");
 const outputPath = path.join(outputDir, "ffactions");
 
@@ -26,6 +28,14 @@ function stripCliModule(source) {
   return source
     .replace(/^#!\/usr\/bin\/env node\n\n/, "")
     .replace(/^"use strict";\n\n/, "")
+    .replace(
+      /^const EMBEDDED_CLI_PACKAGE_VERSION = null;\n/m,
+      `const EMBEDDED_CLI_PACKAGE_VERSION = ${JSON.stringify(packageVersion())};\n`
+    )
+    .replace(
+      /^const EMBEDDED_CLI_BUILD_SHA = null;\n/m,
+      `const EMBEDDED_CLI_BUILD_SHA = ${JSON.stringify(gitShortSha())};\n`
+    )
     .replace(/^const fs = require\("node:fs"\);\n/m, "")
     .replace(/^const path = require\("node:path"\);\n/m, "")
     .replace(
@@ -34,6 +44,22 @@ function stripCliModule(source) {
     )
     .replace(/fork-friendly-actions/g, "ffactions")
     .replace(/\nmodule\.exports = \{[\s\S]*?\n\};\n?$/, "");
+}
+
+function packageVersion() {
+  return JSON.parse(fs.readFileSync(packagePath, "utf8")).version;
+}
+
+function gitShortSha() {
+  try {
+    return childProcess.execFileSync("git", ["rev-parse", "--short=8", "HEAD"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
 }
 
 function loadPublicRunners() {

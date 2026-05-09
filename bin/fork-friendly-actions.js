@@ -14,10 +14,18 @@ const {
   shouldFail,
 } = require("../src/index.js");
 
+const EMBEDDED_CLI_PACKAGE_VERSION = null;
+const EMBEDDED_CLI_BUILD_SHA = null;
+
 function main(argv) {
   const parsed = parseArgs(argv);
   if (parsed.help) {
     printHelp();
+    return 0;
+  }
+
+  if (parsed.version) {
+    console.log(resolveCliVersion());
     return 0;
   }
 
@@ -65,6 +73,10 @@ function parseArgs(argv) {
       case "--help":
       case "-h":
         parsed.help = true;
+        break;
+      case "--version":
+      case "-v":
+        parsed.version = true;
         break;
       case "--dry-run":
       case "-d":
@@ -121,6 +133,45 @@ function parseArgs(argv) {
   }
 
   return parsed;
+}
+
+function resolveCliVersion({ cwd = path.resolve(__dirname, "..") } = {}) {
+  const version = process.env.FFACTIONS_VERSION || EMBEDDED_CLI_PACKAGE_VERSION || readCliPackageVersion();
+  const buildSha = Object.prototype.hasOwnProperty.call(process.env, "FFACTIONS_BUILD_SHA")
+    ? process.env.FFACTIONS_BUILD_SHA
+    : EMBEDDED_CLI_BUILD_SHA || detectGitShortSha(cwd);
+  return formatCliVersion({ version, buildSha });
+}
+
+function formatCliVersion({ version, buildSha }) {
+  const normalizedVersion = String(version || "0.0.0").trim();
+  const normalizedSha = String(buildSha || "").trim();
+  if (!normalizedSha) {
+    return normalizedVersion;
+  }
+  return `${normalizedVersion}+${normalizedSha.slice(0, 8)}`;
+}
+
+function readCliPackageVersion() {
+  try {
+    const packagePath = path.resolve(__dirname, "..", "package.json");
+    const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+    return packageJson.version || "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+function detectGitShortSha(cwd) {
+  try {
+    return childProcess.execFileSync("git", ["rev-parse", "--short=8", "HEAD"], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
 }
 
 function requireValue(args, index, flag) {
@@ -1412,6 +1463,7 @@ Options:
   -a, --allow-runners <lbls>  Comma-separated extra runner labels to treat as fork-friendly.
   -l, --fail-on <level>       Exit nonzero at error, warning, or none. Default: error (none when --fix is used).
   -d, --dry-run               Print what would change without writing files.
+  -v, --version               Show the ffactions version.
   -h, --help                  Show this help.
 
 Arguments:
@@ -1433,6 +1485,7 @@ module.exports = {
   buildInteractiveBuffer,
   buildInteractiveLegendLines,
   detectRepoSlugFromGit,
+  formatCliVersion,
   main,
   parseInteractiveAction,
   parseInteractiveChoice,
@@ -1440,6 +1493,7 @@ module.exports = {
   parseArgs,
   parseOwnerFromRemote,
   parseRepoSlugFromRemote,
+  resolveCliVersion,
   resolveCliTarget,
   runInteractiveFix,
   wrapInteractiveBufferLine,
