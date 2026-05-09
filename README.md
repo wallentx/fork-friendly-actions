@@ -1,7 +1,14 @@
 # Fork Friendly Actions
 
+[![CI](https://github.com/wallentx/fork-friendly-actions/actions/workflows/ci.yml/badge.svg)](https://github.com/wallentx/fork-friendly-actions/actions/workflows/ci.yml)
+[![Fork Friendly Audit](https://github.com/wallentx/fork-friendly-actions/actions/workflows/fork-friendly-audit.yml/badge.svg)](https://github.com/wallentx/fork-friendly-actions/actions/workflows/fork-friendly-audit.yml)
+[![GitHub release](https://img.shields.io/github/v/release/wallentx/fork-friendly-actions?display_name=tag&sort=semver)](https://github.com/wallentx/fork-friendly-actions/releases)
+[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-Fork%20Friendly%20Actions-blue?logo=github)](https://github.com/marketplace/actions/fork-friendly-actions)
+
 Evaluate GitHub Actions workflows for CI patterns that break on forks, then
 rewrite the fixable ones.
+
+## About
 
 Open source contributors should be able to fork a repository, enable Actions on
 their fork, and get useful feedback before asking maintainers to run upstream CI.
@@ -19,6 +26,68 @@ ambiguous workflow logic as manual findings.
 The set of public GitHub-hosted runner labels is committed in
 `data/public-github-hosted-runners.txt`. Runtime checks use that file instead of
 regex heuristics so the behavior is deterministic and reviewable.
+
+---
+
+- [Usage](#usage)
+- [CLI Usage](#cli-usage)
+- [What It Changes](#what-it-changes)
+- [Fix Patterns](#fix-patterns)
+- [Customizing](#customizing)
+- [Publishing To GitHub Marketplace](#publishing-to-github-marketplace)
+- [Maintaining The Public Runner List](#maintaining-the-public-runner-list)
+
+## Usage
+
+Add this action to a workflow that runs when workflow files change:
+
+```yaml
+name: Fork friendly workflow audit
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/**"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: wallentx/fork-friendly-actions@v1
+```
+
+The action checks by default. Use `fail-on: warning` when you want every finding
+to block the PR:
+
+```yaml
+- uses: wallentx/fork-friendly-actions@v1
+  with:
+    fail-on: warning
+```
+
+To let the action rewrite workflow files in the checkout:
+
+```yaml
+- uses: wallentx/fork-friendly-actions@v1
+  with:
+    mode: fix
+```
+
+Allow repository-specific runner labels when they are available to forks:
+
+```yaml
+- uses: wallentx/fork-friendly-actions@v1
+  with:
+    allow-runners: larger-ubuntu-4core,public-arm-runner
+```
 
 ## CLI Usage
 
@@ -162,55 +231,6 @@ becomes:
     TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 ```
 
-## Action Usage
-
-```yaml
-name: Fork friendly workflow audit
-
-on:
-  pull_request:
-    paths:
-      - ".github/workflows/**"
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/**"
-
-jobs:
-  audit:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: wallentx/fork-friendly-actions@v1
-```
-
-The action checks by default. To let it rewrite workflow files in the checkout:
-
-```yaml
-- uses: wallentx/fork-friendly-actions@v1
-  with:
-    mode: fix
-```
-
-Use `fail-on: warning` when you want every finding to block the PR:
-
-```yaml
-- uses: wallentx/fork-friendly-actions@v1
-  with:
-    fail-on: warning
-```
-
-Allow repository-specific runner labels when they are available to forks:
-
-```yaml
-- uses: wallentx/fork-friendly-actions@v1
-  with:
-    allow-runners: larger-ubuntu-4core,public-arm-runner
-```
-
 ## Fix Patterns
 
 Use a public fallback for private runners:
@@ -241,7 +261,9 @@ steps:
       TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 ```
 
-## Inputs
+## Customizing
+
+### Inputs
 
 | Input | Default | Description |
 | --- | --- | --- |
@@ -253,7 +275,7 @@ steps:
 | `upstream-owner` | derived from `upstream-repo` when possible | Owner name used as a fallback when `upstream-repo` is not set. |
 | `runner-fallback` | `ubuntu-latest` | Public runner used when adding fork fallbacks. |
 
-## Outputs
+### Outputs
 
 | Output | Description |
 | --- | --- |
