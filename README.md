@@ -265,13 +265,18 @@ steps:
 
 ## Publishing To GitHub Marketplace
 
-GitHub Marketplace requires this repository to be public, contain a single root
-`action.yml` or `action.yaml`, and contain no workflow files. Publish by creating
-a release and selecting "Publish this Action to the GitHub Marketplace". See
-[Publishing actions in GitHub Marketplace](https://docs.github.com/en/actions/how-tos/creating-and-publishing-actions/publishing-actions-in-github-marketplace).
+Publish by creating a release and selecting "Publish this Action to the GitHub
+Marketplace". The repository must be public, and the Marketplace listing is
+driven by the root `action.yml` metadata file. See
+[Publishing actions in GitHub Marketplace](https://docs.github.com/en/actions/how-tos/create-and-publish-actions/publish-in-github-marketplace).
 
-This repository intentionally does not include `.github/workflows` so it remains
-eligible for Marketplace listing.
+The action runtime is the committed bundle at `dist/action/index.js`. Rebuild it
+with `npm run build` before cutting a release so consumers can run
+`wallentx/fork-friendly-actions@v1` without installing dependencies.
+
+This repository uses its own `.github/workflows` for CI, fork-friendliness
+checks, dependency updates, release candidates, full releases, and release
+checkpoint PRs.
 
 ## Maintaining The Public Runner List
 
@@ -286,9 +291,7 @@ The ready-to-use GitHub Actions workflow template lives at:
 
 - `contrib/update-public-github-hosted-runners.workflow.yml`
 
-That workflow template is intentionally not active in this repository because
-GitHub Marketplace action repositories must not contain workflow files. Run it
-from a companion automation repository or another repository that can open pull
-requests against this one. Set `TARGET_REPOSITORY` in the workflow template to
-the repository you want to update, and provide an `UPDATER_TOKEN` secret that
-can push branches and open pull requests there.
+Copy that template into `.github/workflows/` when you want scheduled runner-list
+refresh PRs. Set `TARGET_REPOSITORY` in the workflow template to the repository
+you want to update, and provide an `UPDATER_TOKEN` secret that can push branches
+and open pull requests there.
