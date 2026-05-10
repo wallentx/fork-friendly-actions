@@ -9,6 +9,7 @@ const {
   DEFAULT_PUBLIC_RUNNERS_FILE,
   RULES,
   auditWorkflowFile,
+  evaluateWorkflows,
   buildUpstreamGuardExpression,
   fixWorkflows,
   fixWorkflowFile,
@@ -265,6 +266,176 @@ jobs:
   assert.equal(findings.length, 1);
   assert.equal(findings[0].ruleCode, RULES.SECRET_GATE.code);
   assert.match(findings[0].message, /inherits all caller secrets/);
+});
+
+test("allows secret presence probes and consumers gated by their outputs", () => {
+  const findings = audit(`
+name: Build
+on: pull_request
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - name: Test for secrets access
+        id: check_secrets
+        run: |
+          unset HAS_APPLE_SECRET
+          if [ -n "$APPLE_SECRET" ]; then HAS_APPLE_SECRET='true' ; fi
+          echo HAS_APPLE_SECRET=\${HAS_APPLE_SECRET} >> "$GITHUB_OUTPUT"
+        env:
+          APPLE_SECRET: "\${{ secrets.APPLE_DEV_ID_APP }}"
+      - name: Import Apple app signing certificate
+        if: steps.check_secrets.outputs.HAS_APPLE_SECRET
+        uses: Apple-Actions/import-codesign-certs@v6
+        with:
+          p12-file-base64: \${{ secrets.APPLE_DEV_ID_APP }}
+          p12-password: \${{ secrets.APPLE_DEV_ID_APP_PASS }}
+      - name: Build MacOS DMG
+        env:
+          NOTARIZE: \${{ steps.check_secrets.outputs.HAS_APPLE_SECRET }}
+          APPLE_NOTARIZE_USERNAME: "\${{ secrets.APPLE_NOTARIZE_USERNAME }}"
+          APPLE_NOTARIZE_PASSWORD: "\${{ secrets.APPLE_NOTARIZE_PASSWORD }}"
+          APPLE_TEAM_ID: "\${{ secrets.APPLE_TEAM_ID }}"
+          APPLE_DEV_ID_APP: "\${{ secrets.APPLE_DEV_ID_APP }}"
+          APPLE_DEV_ID_APP_PASS: "\${{ secrets.APPLE_DEV_ID_APP_PASS }}"
+        run: ./build_scripts/build_macos-2-installer.sh
+`);
+
+  assert.deepEqual(findings, []);
+});
+
+test("flags secret probes that expose secret values as outputs", () => {
+  const findings = audit(`
+name: Build
+on: pull_request
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - name: Unsafe secret output
+        id: check_secrets
+        run: echo APPLE_SECRET=\${APPLE_SECRET} >> "$GITHUB_OUTPUT"
+        env:
+          APPLE_SECRET: "\${{ secrets.APPLE_DEV_ID_APP }}"
+`);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.SECRET_GATE.code);
+});
+
+test("allows inherited secrets when local reusable workflow secret paths are owner-gated", () => {
+  const tmpDir = fs.mkdtempSync(path.join(process.cwd(), "tmp-ffactions-inherit-safe-"));
+  try {
+    const workflowsDir = path.join(tmpDir, ".github", "workflows");
+    fs.mkdirSync(workflowsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(workflowsDir, "caller.yml"),
+      `
+name: Caller
+on: pull_request
+jobs:
+  publish:
+    uses: ./.github/workflows/publish.yml
+    secrets: inherit
+`
+    );
+    fs.writeFileSync(
+      path.join(workflowsDir, "publish.yml"),
+      `
+name: Publish
+on:
+  workflow_call:
+jobs:
+  publish:
+    if: github.repository_owner == 'ExampleOrg'
+    runs-on: ubuntu-latest
+    steps:
+      - run: aws s3 cp file s3://example
+        env:
+          AWS_ACCOUNT: \${{ secrets.AWS_ACCOUNT_ID }}
+  nested:
+    if: github.repository_owner == 'ExampleOrg'
+    uses: ./.github/workflows/nested.yml
+    secrets: inherit
+`
+    );
+    fs.writeFileSync(
+      path.join(workflowsDir, "nested.yml"),
+      `
+name: Nested
+on:
+  workflow_call:
+jobs:
+  mark:
+    if: github.repository_owner == 'ExampleOrg'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ secrets.GLUE_API_URL }}"
+`
+    );
+
+    const result = evaluateWorkflows({
+      cwd: tmpDir,
+      workflows: ".github/workflows",
+      upstreamOwner: "ExampleOrg",
+    });
+
+    assert.deepEqual(result.findings, []);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("flags inherited secrets when a local reusable workflow secret path is not owner-gated", () => {
+  const tmpDir = fs.mkdtempSync(path.join(process.cwd(), "tmp-ffactions-inherit-unsafe-"));
+  try {
+    const workflowsDir = path.join(tmpDir, ".github", "workflows");
+    fs.mkdirSync(workflowsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(workflowsDir, "caller.yml"),
+      `
+name: Caller
+on: pull_request
+jobs:
+  publish:
+    uses: ./.github/workflows/publish.yml
+    secrets: inherit
+`
+    );
+    fs.writeFileSync(
+      path.join(workflowsDir, "publish.yml"),
+      `
+name: Publish
+on:
+  workflow_call:
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - run: aws s3 cp file s3://example
+        env:
+          AWS_ACCOUNT: \${{ secrets.AWS_ACCOUNT_ID }}
+`
+    );
+
+    const result = evaluateWorkflows({
+      cwd: tmpDir,
+      workflows: ".github/workflows",
+      upstreamOwner: "ExampleOrg",
+    });
+
+    assert.equal(
+      result.findings.some(
+        (finding) =>
+          finding.ruleCode === RULES.SECRET_GATE.code &&
+          finding.file === ".github/workflows/caller.yml" &&
+          finding.line === 7
+      ),
+      true
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test("allows dynamic runners on owner-gated jobs", () => {
@@ -1591,8 +1762,8 @@ on:
   workflow_call:
     inputs:
       runs-on:
+        required: true
         type: string
-        default: ubuntu-latest
 jobs:
   test:
     runs-on: \${{ inputs.runs-on }}
@@ -1603,6 +1774,61 @@ jobs:
   assert.equal(findings.length, 1);
   assert.equal(findings[0].ruleCode, RULES.RUNNER_EXPRESSION.code);
   assert.match(findings[0].message, /cannot be locally resolved to a known public GitHub-hosted runner/);
+});
+
+test("resolves reusable workflow input runners from local workflow callers", () => {
+  const tmpDir = fs.mkdtempSync(path.join(process.cwd(), "tmp-ffactions-reusable-runners-"));
+  try {
+    const workflowsDir = path.join(tmpDir, ".github", "workflows");
+    fs.mkdirSync(workflowsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(workflowsDir, "test-single.yml"),
+      `
+name: test-single
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        required: true
+        type: string
+jobs:
+  test:
+    strategy:
+      matrix:
+        os:
+          - runs-on: \${{ inputs.runs-on }}
+    runs-on: \${{ matrix.os.runs-on }}
+    steps:
+      - run: echo test
+`
+    );
+    fs.writeFileSync(
+      path.join(workflowsDir, "test.yml"),
+      `
+name: test
+on: pull_request
+jobs:
+  macos:
+    uses: ./.github/workflows/test-single.yml
+    with:
+      runs-on: macos-15
+  ubuntu:
+    uses: ./.github/workflows/test-single.yml
+    with:
+      runs-on: \${{ github.repository_owner == 'ExampleOrg' && github.event.repository.visibility == 'private' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+`
+    );
+
+    const result = evaluateWorkflows({
+      cwd: tmpDir,
+      workflows: ".github/workflows",
+      upstreamOwner: "ExampleOrg",
+    });
+
+    assert.deepEqual(result.findings, []);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test("workflow template lives outside marketplace-disqualifying workflow paths", () => {

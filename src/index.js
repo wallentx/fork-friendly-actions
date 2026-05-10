@@ -116,6 +116,10 @@ function isWorkflowFile(filePath) {
   return /\.ya?ml$/i.test(filePath);
 }
 
+function normalizePathSeparators(filePath) {
+  return String(filePath).split(path.sep).join("/");
+}
+
 function parseRunnerAllowList(extraRunners) {
   return new Set(
     String(extraRunners)
@@ -209,6 +213,10 @@ function evaluateWorkflows({
   const workflowsPath = path.resolve(cwd, workflows);
   const allowList = parseRunnerAllowList(allowRunners);
   const files = discoverWorkflowFiles(workflowsPath);
+  const contextFiles = workflowContextFiles(workflowsPath, files);
+  const workflowRoot = inferWorkflowRoot(cwd, workflowsPath);
+  const reusableWorkflowInputs = collectReusableWorkflowInputValues({ cwd, workflowRoot, files: contextFiles });
+  const reusableWorkflowSecretSafety = collectReusableWorkflowSecretSafety({ cwd, workflowRoot, files: contextFiles });
   const findings = [];
   const changes = [];
   const fileChanges = [];
@@ -224,6 +232,9 @@ function evaluateWorkflows({
       upstreamOwner,
       allowList,
       runnerFallback,
+      workflowRoot,
+      reusableWorkflowInputs,
+      reusableWorkflowSecretSafety,
       mode,
     });
     findings.push(...result.findings);
@@ -260,6 +271,157 @@ function evaluateWorkflows({
     changedFiles: [...new Set(changes.map((change) => change.file))],
     summary: summarizeFindings(findings, changes),
   };
+}
+
+function workflowContextFiles(workflowsPath, files) {
+  try {
+    if (fs.statSync(workflowsPath).isFile()) {
+      return discoverWorkflowFiles(path.dirname(workflowsPath));
+    }
+  } catch {
+    return files;
+  }
+  return files;
+}
+
+function inferWorkflowRoot(cwd, workflowsPath) {
+  try {
+    const stat = fs.statSync(workflowsPath);
+    const workflowDir = stat.isFile() ? path.dirname(workflowsPath) : workflowsPath;
+    if (path.basename(workflowDir) === "workflows" && path.basename(path.dirname(workflowDir)) === ".github") {
+      return path.dirname(path.dirname(workflowDir));
+    }
+  } catch {
+    // Fall through to cwd when the target cannot be inspected.
+  }
+  return cwd;
+}
+
+function collectReusableWorkflowInputValues({ cwd, workflowRoot, files }) {
+  const valuesByWorkflow = new Map();
+
+  for (const filePath of files) {
+    let source;
+    try {
+      source = fs.readFileSync(filePath, "utf8");
+    } catch {
+      continue;
+    }
+    const workflowModel = parseWorkflowModel(source);
+    for (const job of workflowModel.jobs.values()) {
+      const targetWorkflow = localReusableWorkflowTarget(job.uses, { callerFilePath: filePath, cwd, workflowRoot });
+      if (!targetWorkflow || !job.with || typeof job.with !== "object" || Array.isArray(job.with)) {
+        continue;
+      }
+      if (!valuesByWorkflow.has(targetWorkflow)) {
+        valuesByWorkflow.set(targetWorkflow, new Map());
+      }
+      const targetInputs = valuesByWorkflow.get(targetWorkflow);
+      for (const [inputName, inputValue] of Object.entries(job.with)) {
+        if (!targetInputs.has(inputName)) {
+          targetInputs.set(inputName, []);
+        }
+        targetInputs.get(inputName).push(inputValue);
+      }
+    }
+  }
+
+  return valuesByWorkflow;
+}
+
+function collectReusableWorkflowSecretSafety({ cwd, workflowRoot, files }) {
+  const workflows = new Map();
+  for (const filePath of files) {
+    let source;
+    try {
+      source = fs.readFileSync(filePath, "utf8");
+    } catch {
+      continue;
+    }
+    workflows.set(normalizePathSeparators(path.relative(cwd, filePath)), {
+      filePath,
+      workflowModel: parseWorkflowModel(source),
+    });
+  }
+
+  const memo = new Map();
+  const visiting = new Set();
+
+  function isWorkflowSecretSafe(relativeFile) {
+    const normalizedFile = normalizePathSeparators(relativeFile);
+    if (memo.has(normalizedFile)) {
+      return memo.get(normalizedFile);
+    }
+
+    const workflow = workflows.get(normalizedFile);
+    if (!workflow || visiting.has(normalizedFile)) {
+      memo.set(normalizedFile, false);
+      return false;
+    }
+
+    visiting.add(normalizedFile);
+    let safe = true;
+    for (const job of workflow.workflowModel.jobs.values()) {
+      if (!jobSecretPathsAreOwnerGated({ job, callerFilePath: workflow.filePath, cwd, workflowRoot, isWorkflowSecretSafe })) {
+        safe = false;
+        break;
+      }
+    }
+    visiting.delete(normalizedFile);
+    memo.set(normalizedFile, safe);
+    return safe;
+  }
+
+  for (const relativeFile of workflows.keys()) {
+    isWorkflowSecretSafe(relativeFile);
+  }
+
+  return memo;
+}
+
+function jobSecretPathsAreOwnerGated({ job, callerFilePath, cwd, workflowRoot, isWorkflowSecretSafe }) {
+  if (job.hasOwnerGuard) {
+    return true;
+  }
+
+  if (job.uses) {
+    const passesSecrets = job.secrets === "inherit" || (job.secretNames || []).length > 0;
+    if (passesSecrets) {
+      const targetWorkflow = localReusableWorkflowTarget(job.uses, { callerFilePath, cwd, workflowRoot });
+      if (!targetWorkflow || !isWorkflowSecretSafe(targetWorkflow)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if ((job.secretNames || []).length > 0) {
+    return false;
+  }
+
+  for (const step of job.steps || []) {
+    if ((step.secretNames || []).length > 0 && !step.hasOwnerGuard) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function localReusableWorkflowTarget(uses, { callerFilePath, cwd, workflowRoot }) {
+  const usesText = String(uses || "").trim();
+  if (!usesText) {
+    return "";
+  }
+
+  let targetPath = "";
+  if (usesText.startsWith("./.github/workflows/")) {
+    targetPath = path.resolve(workflowRoot, usesText);
+  } else if (usesText.startsWith("./") || usesText.startsWith("../")) {
+    targetPath = path.resolve(path.dirname(callerFilePath), usesText);
+  }
+
+  return targetPath ? normalizePathSeparators(path.relative(cwd, targetPath)) : "";
 }
 
 function auditWorkflowFile({ filePath, source, cwd, upstreamRepo = "", upstreamOwner = "", allowList = new Set() }) {
@@ -299,6 +461,9 @@ function evaluateWorkflowFile({
   upstreamOwner = "",
   allowList = new Set(),
   runnerFallback = DEFAULT_RUNNER_FALLBACK,
+  workflowRoot = cwd,
+  reusableWorkflowInputs = new Map(),
+  reusableWorkflowSecretSafety = new Map(),
   mode = "check",
 }) {
   const relativeFile = path.relative(cwd, filePath) || filePath;
@@ -309,9 +474,11 @@ function evaluateWorkflowFile({
   const workflowModel = parseWorkflowModel(source);
   const jobs = buildJobsFromWorkflowModel(workflowModel, lines);
   const upstreamScope = normalizeUpstreamScope({ upstreamRepo, upstreamOwner });
+  const workflowInputValues = reusableWorkflowInputs.get(normalizePathSeparators(relativeFile)) || new Map();
   const initiallyGatedJobIds = new Set();
   const outputBlockedJobIds = new Set();
   const directlyGatedStepIdsByJob = new Map();
+  const secretProbeOutputsByJob = new Map();
 
   for (const job of jobs) {
     job.relativeFile = relativeFile;
@@ -339,6 +506,8 @@ function evaluateWorkflowFile({
       runsOn: null,
       matrixValues: {},
       matrixExcludes: [],
+      with: undefined,
+      withLine: 0,
     };
     job.needs = job.parsed.needs;
     job.hasOwnerGuard = job.hasOwnerGuard || Boolean(job.parsed.hasOwnerGuard);
@@ -376,13 +545,23 @@ function evaluateWorkflowFile({
       job.id,
       new Set(job.steps.filter((step) => step.hasOwnerGuard && step.parsed.id).map((step) => step.parsed.id))
     );
+    secretProbeOutputsByJob.set(job.id, collectSecretProbeOutputs(job));
   }
 
   for (const job of jobs) {
     const runsOn = job.parsed.runsOn;
     if (runsOn) {
       const runnerLine = runsOn.startLine || (runsOn.startIndex + 1);
-      const runnerResult = auditRunsOn({ relativeFile, lineNumber: runnerLine, runsOn, guard: job, upstreamScope, allowList });
+      const runnerResult = auditRunsOn({
+        relativeFile,
+        lineNumber: runnerLine,
+        runsOn,
+        guard: job,
+        workflowModel,
+        workflowInputValues,
+        upstreamScope,
+        allowList,
+      });
       findings.push(...runnerResult.findings);
       if (runnerResult.fixKind === "job-guard") {
         initiallyGatedJobIds.add(job.id);
@@ -428,6 +607,11 @@ function evaluateWorkflowFile({
       const inheritedSecrets = job.parsed.secrets === "inherit";
       const passedSecretNames = job.parsed.secretNames || [];
       if (inheritedSecrets || passedSecretNames.length > 0) {
+        const targetWorkflow = localReusableWorkflowTarget(job.parsed.uses, { callerFilePath: filePath, cwd, workflowRoot });
+        const targetSecretSafe = targetWorkflow && reusableWorkflowSecretSafety.get(targetWorkflow) === true;
+        if (targetSecretSafe) {
+          continue;
+        }
         const jobEdit = makeOwnerGuardEdit({ step: null, job, upstreamScope });
         const detail = inheritedSecrets
           ? "This reusable-workflow caller inherits all caller secrets, which are not available on fork pull requests."
@@ -455,6 +639,10 @@ function evaluateWorkflowFile({
     for (const step of job.steps) {
       const secretNames = step.parsed.secretNames || [];
       if (secretNames.length > 0 && !step.hasOwnerGuard && !job.hasOwnerGuard) {
+        const secretProbeOutputs = secretProbeOutputsByJob.get(job.id) || new Map();
+        if (isSecretProbeStep(step, secretProbeOutputs) || stepUsesSecretProbeOutput(step, secretProbeOutputs)) {
+          continue;
+        }
         const stepEdit = makeOwnerGuardEdit({ step, job, upstreamScope });
         const firstSecretRef = step.parsed.secretRefs && step.parsed.secretRefs.length > 0 ? step.parsed.secretRefs[0] : null;
         findings.push({
@@ -682,17 +870,18 @@ function parseWorkflowModel(source) {
       uniqueKeys: false,
     });
   } catch {
-    return { env: undefined, events: new Set(), jobs: new Map(), workflowOutputs: [] };
+    return { env: undefined, events: new Set(), jobs: new Map(), workflowCallInputs: {}, workflowOutputs: [] };
   }
 
   if (document.errors && document.errors.length > 0) {
-    return { env: undefined, events: new Set(), jobs: new Map(), workflowOutputs: [] };
+    return { env: undefined, events: new Set(), jobs: new Map(), workflowCallInputs: {}, workflowOutputs: [] };
   }
 
   const env = yamlNodeToJSON(document.get("env", true));
   const events = parseWorkflowEvents(document);
   const jobsNode = document.get("jobs", true);
   const jobs = new Map();
+  const workflowCallInputs = parseWorkflowCallInputs(document, lineCounter);
   const workflowOutputs = parseWorkflowCallOutputs(document, lineCounter);
 
   if (jobsNode && typeof jobsNode === "object" && Array.isArray(jobsNode.items)) {
@@ -708,6 +897,7 @@ function parseWorkflowModel(source) {
       const secretsPair = getYamlMapPair(jobPair.value, "secrets");
       const ifPair = getYamlMapPair(jobPair.value, "if");
       const envPair = getYamlMapPair(jobPair.value, "env");
+      const withPair = getYamlMapPair(jobPair.value, "with");
       const outputsPair = getYamlMapPair(jobPair.value, "outputs");
       const stepsPair = getYamlMapPair(jobPair.value, "steps");
       const runsOnPair = getYamlMapPair(jobPair.value, "runs-on");
@@ -716,6 +906,7 @@ function parseWorkflowModel(source) {
       const ifValue = yamlNodeToString(ifPair && ifPair.value);
       const usesValue = yamlNodeToString(usesPair && usesPair.value);
       const envValue = yamlNodeToJSON(envPair && envPair.value);
+      const withValue = yamlNodeToJSON(withPair && withPair.value);
       const secretsValue = yamlNodeToJSON(secretsPair && secretsPair.value);
       const outputs = parseJobOutputs(outputsPair && outputsPair.value, lineCounter);
       const steps = parseJobSteps(stepsPair && stepsPair.value, lineCounter);
@@ -741,6 +932,8 @@ function parseWorkflowModel(source) {
         secretNames: extractSecretNamesFromValue(secretsValue),
         env: envValue,
         envLine: yamlNodeLine(lineCounter, envPair && envPair.key),
+        with: withValue,
+        withLine: yamlNodeLine(lineCounter, withPair && withPair.key),
         outputs,
         outputsLine: yamlNodeLine(lineCounter, outputsPair && outputsPair.key),
         steps,
@@ -751,7 +944,7 @@ function parseWorkflowModel(source) {
     }
   }
 
-  return { env, events, jobs, workflowOutputs };
+  return { env, events, jobs, workflowCallInputs, workflowOutputs };
 }
 
 function parseWorkflowEvents(document) {
@@ -787,6 +980,30 @@ function workflowHasPullRequestEvent(events) {
     }
   }
   return false;
+}
+
+function parseWorkflowCallInputs(document, lineCounter) {
+  const inputsNode = document.getIn(["on", "workflow_call", "inputs"], true);
+  if (!inputsNode || !Array.isArray(inputsNode.items)) {
+    return {};
+  }
+
+  const inputs = {};
+  for (const inputPair of inputsNode.items) {
+    const name = yamlNodeToString(inputPair.key);
+    if (!name) {
+      continue;
+    }
+    const value = yamlNodeToJSON(inputPair.value);
+    inputs[name] = {
+      name,
+      line: yamlNodeLine(lineCounter, inputPair.key),
+      required: Boolean(value && typeof value === "object" && value.required),
+      type: value && typeof value === "object" ? String(value.type || "") : "",
+      default: value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, "default") ? value.default : undefined,
+    };
+  }
+  return inputs;
 }
 
 function isRepoScopedGitHubCliCommand({ workflowModel, job, step }) {
@@ -1351,6 +1568,89 @@ function collectNeedsPropagationFindings({ jobs, reverseNeeds, initiallyGatedJob
   return { findings, edits, gatedJobIds: visited };
 }
 
+function collectSecretProbeOutputs(job) {
+  const probes = new Map();
+  for (const step of job.steps || []) {
+    const outputs = detectSecretProbeOutputNames(step.parsed || {});
+    if (step.parsed?.id && outputs.length > 0) {
+      probes.set(step.parsed.id, new Set(outputs));
+    }
+  }
+  return probes;
+}
+
+function isSecretProbeStep(step, secretProbeOutputs) {
+  return Boolean(step.parsed?.id && secretProbeOutputs.has(step.parsed.id));
+}
+
+function stepUsesSecretProbeOutput(step, secretProbeOutputs) {
+  for (const reference of step.parsed?.stepOutputRefs || []) {
+    if (secretProbeOutputs.get(reference.stepId)?.has(reference.outputName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function detectSecretProbeOutputNames(parsedStep) {
+  if (!parsedStep.id || (parsedStep.secretNames || []).length === 0) {
+    return [];
+  }
+
+  const secretEnvVars = secretBackedEnvVarNames(parsedStep.env);
+  const run = String(parsedStep.run || "");
+  if (secretEnvVars.length === 0 || !/\bGITHUB_OUTPUT\b/.test(run)) {
+    return [];
+  }
+  if (!secretEnvVars.some((envName) => shellVariablePattern(envName).test(run))) {
+    return [];
+  }
+  if (writesSecretEnvVarToGithubOutput(run, secretEnvVars)) {
+    return [];
+  }
+
+  return extractGithubOutputNames(run);
+}
+
+function secretBackedEnvVarNames(env) {
+  if (!env || typeof env !== "object" || Array.isArray(env)) {
+    return [];
+  }
+  return Object.entries(env)
+    .filter(([, value]) => extractSecretNamesFromValue(value).length > 0)
+    .map(([name]) => name);
+}
+
+function writesSecretEnvVarToGithubOutput(run, secretEnvVars) {
+  return String(run)
+    .split(/\r?\n/)
+    .filter((line) => /\bGITHUB_OUTPUT\b/.test(line))
+    .some((line) => secretEnvVars.some((envName) => shellVariablePattern(envName).test(line)));
+}
+
+function extractGithubOutputNames(run) {
+  const names = new Set();
+  for (const line of String(run).split(/\r?\n/)) {
+    if (!/\bGITHUB_OUTPUT\b/.test(line)) {
+      continue;
+    }
+    const echoMatch = line.match(/\becho\s+["']?([A-Za-z_][A-Za-z0-9_]*)=/);
+    if (echoMatch) {
+      names.add(echoMatch[1]);
+    }
+  }
+  return [...names];
+}
+
+function shellVariablePattern(name) {
+  const escapedName = escapeRegExp(name);
+  return new RegExp(`\\$(?:\\{${escapedName}\\}|${escapedName}\\b)`);
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
 function jobBypassesSkippedNeeds(job) {
   const condition = String(job.parsed && job.parsed.if ? job.parsed.if : "").trim();
   if (!condition) {
@@ -1431,7 +1731,7 @@ function parseRunnerLabels(value) {
   return [cleanYamlScalar(trimmed)].filter(Boolean);
 }
 
-function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamScope, allowList }) {
+function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, workflowModel, workflowInputValues, upstreamScope, allowList }) {
   const location = runsOnLocation(runsOn, lineNumber);
   if (runsOn.usesGroup) {
     if (guard?.hasOwnerGuard) {
@@ -1461,12 +1761,19 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, upstreamScope, a
     const expression = stripExpressionDelimiters(raw);
     const hasOwnerExpression = OWNER_GUARD_PATTERNS.some((pattern) => pattern.test(raw));
     const hasFallback = /&&/.test(raw) && /\|\|/.test(raw);
-    const matrixResolution = resolveMatrixRunnerExpression(raw, guard?.matrixValues || {}, guard?.matrixExcludes || [], allowList);
+    const matrixResolution = resolveMatrixRunnerExpression(
+      raw,
+      guard?.matrixValues || {},
+      guard?.matrixExcludes || [],
+      allowList,
+      workflowInputValues,
+      workflowModel?.workflowCallInputs || {}
+    );
     const expressionFallback = buildMatrixFallbackExpression(expression, guard?.matrixValues || {}, guard?.matrixExcludes || [], allowList);
     if (guard?.hasOwnerGuard) {
       return { fixable: false, findings: [] };
     }
-    if (matrixResolution.isKnownPublic) {
+    if (matrixResolution.isKnownPublic || matrixResolution.isForkFriendly) {
       return { fixable: false, findings: [] };
     }
     if (matrixResolution.hasSelfHosted) {
@@ -1570,11 +1877,15 @@ function makeRunsOnEdit({ lines, runsOn, upstreamScope, runnerFallback, preferre
   };
 }
 
-function resolveMatrixRunnerExpression(raw, matrixValues, matrixExcludes, allowList) {
+function resolveMatrixRunnerExpression(raw, matrixValues, matrixExcludes, allowList, workflowInputValues = new Map(), workflowCallInputs = {}) {
   const expression = stripExpressionDelimiters(raw);
   const simpleReferences = extractMatrixReferences(expression);
 
   if (simpleReferences.length === 0) {
+    const inputValues = resolveWorkflowCallInputRunnerValues(expression, workflowInputValues, workflowCallInputs);
+    if (inputValues.length > 0) {
+      return summarizeResolvedRunnerValues(inputValues, allowList, []);
+    }
     return { isKnownPublic: false };
   }
 
@@ -1587,13 +1898,64 @@ function resolveMatrixRunnerExpression(raw, matrixValues, matrixExcludes, allowL
     resolvedValues.push(...values);
   }
 
+  const expandedValues = expandWorkflowCallInputRunnerValues(resolvedValues, workflowInputValues, workflowCallInputs);
+  if (expandedValues.length === 0) {
+    return { isKnownPublic: false, referencedKeys: simpleReferences, resolvedValues };
+  }
+
+  return summarizeResolvedRunnerValues(expandedValues, allowList, simpleReferences);
+}
+
+function summarizeResolvedRunnerValues(resolvedValues, allowList, referencedKeys) {
   return {
     isKnownPublic: resolvedValues.length > 0 && resolvedValues.every((value) => isPublicRunnerValue(value, allowList)),
+    isForkFriendly: resolvedValues.length > 0 && resolvedValues.every((value) => isForkFriendlyRunnerValue(value, allowList)),
     hasSelfHosted: hasSelfHostedRunner(resolvedValues),
     hasGroup: resolvedValues.some((value) => typeof value === "object" && value && value.group),
-    referencedKeys: simpleReferences,
+    referencedKeys,
     resolvedValues,
   };
+}
+
+function expandWorkflowCallInputRunnerValues(values, workflowInputValues, workflowCallInputs) {
+  const expandedValues = [];
+  for (const value of flattenMatrixResolvedValues(values)) {
+    const inputValues = resolveWorkflowCallInputRunnerValues(value, workflowInputValues, workflowCallInputs);
+    if (inputValues.length > 0) {
+      expandedValues.push(...inputValues);
+      continue;
+    }
+    if (isWorkflowCallInputExpression(value)) {
+      return [];
+    }
+    expandedValues.push(value);
+  }
+  return expandedValues;
+}
+
+function resolveWorkflowCallInputRunnerValues(value, workflowInputValues, workflowCallInputs) {
+  const inputName = workflowCallInputName(value);
+  if (!inputName || !Object.prototype.hasOwnProperty.call(workflowCallInputs, inputName)) {
+    return [];
+  }
+
+  const callerValues = workflowInputValues instanceof Map ? workflowInputValues.get(inputName) || [] : [];
+  if (callerValues.length > 0) {
+    return callerValues;
+  }
+
+  const input = workflowCallInputs[inputName] || {};
+  return Object.prototype.hasOwnProperty.call(input, "default") && input.default !== undefined ? [input.default] : [];
+}
+
+function isWorkflowCallInputExpression(value) {
+  return Boolean(workflowCallInputName(value));
+}
+
+function workflowCallInputName(value) {
+  const expression = stripExpressionDelimiters(value);
+  const match = expression.match(/^inputs\.([A-Za-z_][A-Za-z0-9_-]*)$/);
+  return match ? match[1] : "";
 }
 
 function hasSelfHostedRunner(labels) {
@@ -1839,6 +2201,17 @@ function isPublicRunnerValue(value, allowList) {
     return value.length > 0 && value.every((item) => isPublicRunnerValue(item, allowList));
   }
   return typeof value === "string" && isPublicRunner(value, allowList);
+}
+
+function isForkFriendlyRunnerValue(value, allowList) {
+  if (isPublicRunnerValue(value, allowList)) {
+    return true;
+  }
+  if (typeof value !== "string") {
+    return false;
+  }
+  const expression = stripExpressionDelimiters(value);
+  return OWNER_GUARD_PATTERNS.some((pattern) => pattern.test(expression)) && /&&/.test(expression) && /\|\|/.test(expression);
 }
 
 function stripExpressionDelimiters(value) {
