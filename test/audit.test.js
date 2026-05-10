@@ -659,6 +659,56 @@ jobs:
   assert.deepEqual(findings, []);
 });
 
+test("does not flag GitHub CLI release writes with github.token outside PR workflows", () => {
+  const findings = auditWorkflowFile({
+    filePath: "/repo/.github/workflows/release.yml",
+    source: `
+name: Release
+on:
+  workflow_dispatch:
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload release assets
+        run: gh release upload "$TAG" dist/*.tar.gz --clobber
+        env:
+          GITHUB_TOKEN: \${{ github.token }}
+`,
+    cwd: "/repo",
+    upstreamOwner: "ExampleOrg",
+    allowList: new Set(),
+  });
+
+  assert.deepEqual(findings, []);
+});
+
+test("still flags GitHub CLI release writes with non-repo tokens", () => {
+  const findings = auditWorkflowFile({
+    filePath: "/repo/.github/workflows/release.yml",
+    source: `
+name: Release
+on:
+  workflow_dispatch:
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload release assets
+        run: gh release upload "$TAG" dist/*.tar.gz --clobber
+        env:
+          GH_TOKEN: \${{ secrets.RELEASE_PAT }}
+`,
+    cwd: "/repo",
+    upstreamOwner: "ExampleOrg",
+    allowList: new Set(),
+  });
+
+  assert.equal(findings.length, 2);
+  assert.equal(findings.some((finding) => finding.ruleCode === RULES.PUBLISH_GATE.code && finding.line === 10), true);
+  assert.equal(findings.some((finding) => finding.ruleCode === RULES.SECRET_GATE.code && finding.line === 11), true);
+});
+
 test("still flags release writes with GITHUB_TOKEN when workflow can run for pull requests", () => {
   const findings = auditWorkflowFile({
     filePath: "/repo/.github/workflows/release.yml",

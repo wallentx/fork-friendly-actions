@@ -83,7 +83,7 @@ const PUBLISH_RUN_PATTERNS = [
   /\bgh\s+release\s+(create|upload|edit|delete)\b/i,
 ];
 
-const GITHUB_RELEASE_WRITE_PATTERN = /\bgh\s+release\s+(create|upload|edit|delete)\b/i;
+const GITHUB_CLI_COMMAND_PATTERN = /\bgh\s+[^\s&|;]+/i;
 const PULL_REQUEST_EVENTS = new Set(["pull_request", "pull_request_target"]);
 
 const STEP_OUTPUT_REFERENCE_PATTERN = /\bsteps\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
@@ -480,7 +480,7 @@ function evaluateWorkflowFile({
 
       const publishTriggerLine = step.parsed.publishTriggerLine || 0;
       const publishTrigger = publishTriggerLine > 0 ? { line: publishTriggerLine } : null;
-      if (publishTrigger && !isForkCompatibleGitHubReleaseWrite({ workflowModel, job, step }) && !step.hasOwnerGuard && !job.hasOwnerGuard) {
+      if (publishTrigger && !isRepoScopedGitHubCliCommand({ workflowModel, job, step }) && !step.hasOwnerGuard && !job.hasOwnerGuard) {
         const stepEdit = makeOwnerGuardEdit({ step, job, upstreamScope });
         findings.push({
           severity: "warning",
@@ -789,8 +789,8 @@ function workflowHasPullRequestEvent(events) {
   return false;
 }
 
-function isForkCompatibleGitHubReleaseWrite({ workflowModel, job, step }) {
-  if (!step.parsed.run || !GITHUB_RELEASE_WRITE_PATTERN.test(step.parsed.run)) {
+function isRepoScopedGitHubCliCommand({ workflowModel, job, step }) {
+  if (!step.parsed.run || !GITHUB_CLI_COMMAND_PATTERN.test(step.parsed.run)) {
     return false;
   }
   if (workflowHasPullRequestEvent(workflowModel.events)) {
