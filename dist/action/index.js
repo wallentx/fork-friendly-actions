@@ -8667,6 +8667,9 @@ const PUBLISH_RUN_PATTERNS = [
   /\bgh\s+release\s+(create|upload|edit|delete)\b/i,
 ];
 
+const GITHUB_RELEASE_WRITE_PATTERN = /\bgh\s+release\s+(create|upload|edit|delete)\b/i;
+const PULL_REQUEST_EVENTS = new Set(["pull_request", "pull_request_target"]);
+
 const STEP_OUTPUT_REFERENCE_PATTERN = /\bsteps\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
 const NEEDS_OUTPUT_REFERENCE_PATTERN = /\bneeds\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
 const JOB_OUTPUT_REFERENCE_PATTERN = /\bjobs\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
@@ -8912,6 +8915,8 @@ function evaluateWorkflowFile({
       secretsLine: 0,
       secretRefs: [],
       secretNames: [],
+      env: undefined,
+      envLine: 0,
       outputs: [],
       outputsLine: 0,
       steps: [],
@@ -9059,7 +9064,7 @@ function evaluateWorkflowFile({
 
       const publishTriggerLine = step.parsed.publishTriggerLine || 0;
       const publishTrigger = publishTriggerLine > 0 ? { line: publishTriggerLine } : null;
-      if (publishTrigger && !step.hasOwnerGuard && !job.hasOwnerGuard) {
+      if (publishTrigger && !isForkCompatibleGitHubReleaseWrite({ workflowModel, job, step }) && !step.hasOwnerGuard && !job.hasOwnerGuard) {
         const stepEdit = makeOwnerGuardEdit({ step, job, upstreamScope });
         findings.push({
           severity: "warning",
@@ -9261,13 +9266,15 @@ function parseWorkflowModel(source) {
       uniqueKeys: false,
     });
   } catch {
-    return { jobs: new Map(), workflowOutputs: [] };
+    return { env: undefined, events: new Set(), jobs: new Map(), workflowOutputs: [] };
   }
 
   if (document.errors && document.errors.length > 0) {
-    return { jobs: new Map(), workflowOutputs: [] };
+    return { env: undefined, events: new Set(), jobs: new Map(), workflowOutputs: [] };
   }
 
+  const env = yamlNodeToJSON(document.get("env", true));
+  const events = parseWorkflowEvents(document);
   const jobsNode = document.get("jobs", true);
   const jobs = new Map();
   const workflowOutputs = parseWorkflowCallOutputs(document, lineCounter);
@@ -9284,6 +9291,7 @@ function parseWorkflowModel(source) {
       const usesPair = getYamlMapPair(jobPair.value, "uses");
       const secretsPair = getYamlMapPair(jobPair.value, "secrets");
       const ifPair = getYamlMapPair(jobPair.value, "if");
+      const envPair = getYamlMapPair(jobPair.value, "env");
       const outputsPair = getYamlMapPair(jobPair.value, "outputs");
       const stepsPair = getYamlMapPair(jobPair.value, "steps");
       const runsOnPair = getYamlMapPair(jobPair.value, "runs-on");
@@ -9291,6 +9299,7 @@ function parseWorkflowModel(source) {
 
       const ifValue = yamlNodeToString(ifPair && ifPair.value);
       const usesValue = yamlNodeToString(usesPair && usesPair.value);
+      const envValue = yamlNodeToJSON(envPair && envPair.value);
       const secretsValue = yamlNodeToJSON(secretsPair && secretsPair.value);
       const outputs = parseJobOutputs(outputsPair && outputsPair.value, lineCounter);
       const steps = parseJobSteps(stepsPair && stepsPair.value, lineCounter);
@@ -9314,6 +9323,8 @@ function parseWorkflowModel(source) {
         secretsLine: yamlNodeLine(lineCounter, secretsPair && secretsPair.key),
         secretRefs: extractSecretReferencesFromValue(secretsValue, yamlNodeLine(lineCounter, secretsPair && secretsPair.key)),
         secretNames: extractSecretNamesFromValue(secretsValue),
+        env: envValue,
+        envLine: yamlNodeLine(lineCounter, envPair && envPair.key),
         outputs,
         outputsLine: yamlNodeLine(lineCounter, outputsPair && outputsPair.key),
         steps,
@@ -9324,7 +9335,74 @@ function parseWorkflowModel(source) {
     }
   }
 
-  return { jobs, workflowOutputs };
+  return { env, events, jobs, workflowOutputs };
+}
+
+function parseWorkflowEvents(document) {
+  const onNode = document.get("on", true);
+  const events = new Set();
+  const onValue = yamlNodeToJSON(onNode);
+
+  if (typeof onValue === "string" && onValue) {
+    events.add(onValue);
+  } else if (Array.isArray(onValue)) {
+    for (const eventName of onValue) {
+      if (typeof eventName === "string" && eventName) {
+        events.add(eventName);
+      }
+    }
+  } else if (onValue && typeof onValue === "object") {
+    for (const eventName of Object.keys(onValue)) {
+      events.add(eventName);
+    }
+  }
+
+  return events;
+}
+
+function workflowHasPullRequestEvent(events) {
+  if (!events || events.size === 0) {
+    return true;
+  }
+
+  for (const eventName of events) {
+    if (PULL_REQUEST_EVENTS.has(eventName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isForkCompatibleGitHubReleaseWrite({ workflowModel, job, step }) {
+  if (!step.parsed.run || !GITHUB_RELEASE_WRITE_PATTERN.test(step.parsed.run)) {
+    return false;
+  }
+  if (workflowHasPullRequestEvent(workflowModel.events)) {
+    return false;
+  }
+
+  return usesCurrentRepositoryGitHubToken({
+    workflowEnv: workflowModel.env,
+    jobEnv: job.parsed.env,
+    stepEnv: step.parsed.env,
+  });
+}
+
+function usesCurrentRepositoryGitHubToken({ workflowEnv, jobEnv, stepEnv }) {
+  const env = {
+    ...normalizeEnvMap(workflowEnv),
+    ...normalizeEnvMap(jobEnv),
+    ...normalizeEnvMap(stepEnv),
+  };
+  const tokenValue = Object.prototype.hasOwnProperty.call(env, "GH_TOKEN") ? env.GH_TOKEN : env.GITHUB_TOKEN;
+  return /\b(secrets\.GITHUB_TOKEN|github\.token)\b/i.test(String(tokenValue || ""));
+}
+
+function normalizeEnvMap(env) {
+  if (!env || typeof env !== "object" || Array.isArray(env)) {
+    return {};
+  }
+  return env;
 }
 
 function parseWorkflowCallOutputs(document, lineCounter) {

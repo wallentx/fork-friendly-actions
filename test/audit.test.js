@@ -623,6 +623,96 @@ jobs:
   assert.equal(findings[1].line, 10);
 });
 
+test("does not flag current-repo GitHub release writes with GITHUB_TOKEN outside PR workflows", () => {
+  const findings = auditWorkflowFile({
+    filePath: "/repo/.github/workflows/release.yml",
+    source: `
+name: Release
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Ensure GitHub release exists
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
+          fi
+      - name: Upload release assets
+        run: gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/*.zip --clobber
+`,
+    cwd: "/repo",
+    upstreamOwner: "ExampleOrg",
+    allowList: new Set(),
+  });
+
+  assert.deepEqual(findings, []);
+});
+
+test("still flags release writes with GITHUB_TOKEN when workflow can run for pull requests", () => {
+  const findings = auditWorkflowFile({
+    filePath: "/repo/.github/workflows/release.yml",
+    source: `
+name: Release
+on:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Create release
+        run: gh release create "$TAG"
+`,
+    cwd: "/repo",
+    upstreamOwner: "ExampleOrg",
+    allowList: new Set(),
+  });
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.PUBLISH_GATE.code);
+  assert.equal(findings[0].line, 13);
+});
+
+test("still flags external publish and cloud auth in manual release workflows", () => {
+  const findings = auditWorkflowFile({
+    filePath: "/repo/.github/workflows/release.yml",
+    source: `
+name: Release
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm publish
+      - uses: google-github-actions/auth@v2
+`,
+    cwd: "/repo",
+    upstreamOwner: "ExampleOrg",
+    allowList: new Set(),
+  });
+
+  assert.equal(findings.length, 2);
+  assert.equal(findings[0].ruleCode, RULES.PUBLISH_GATE.code);
+  assert.equal(findings[1].ruleCode, RULES.PUBLISH_GATE.code);
+});
+
 test("ignores GITHUB_TOKEN secret compatibility", () => {
   const findings = audit(`
 name: Label
