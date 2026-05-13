@@ -89,6 +89,7 @@ const PULL_REQUEST_EVENTS = new Set(["pull_request", "pull_request_target"]);
 const STEP_OUTPUT_REFERENCE_PATTERN = /\bsteps\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
 const NEEDS_OUTPUT_REFERENCE_PATTERN = /\bneeds\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
 const JOB_OUTPUT_REFERENCE_PATTERN = /\bjobs\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
+const SECRET_PRESENCE_EXPRESSION_PATTERN = /\$\{\{\s*secrets\.[A-Za-z_][A-Za-z0-9_]*\s*(?:!=|==)\s*(?:""|'')\s*\}\}/g;
 
 function discoverWorkflowFiles(workflowsPath) {
   if (!fs.existsSync(workflowsPath)) {
@@ -547,6 +548,8 @@ function evaluateWorkflowFile({
     );
     secretProbeOutputsByJob.set(job.id, collectSecretProbeOutputs(job));
   }
+
+  markJobsGatedByNeedsOutputs(jobs, initiallyGatedJobIds);
 
   for (const job of jobs) {
     const runsOn = job.parsed.runsOn;
@@ -1568,6 +1571,46 @@ function collectNeedsPropagationFindings({ jobs, reverseNeeds, initiallyGatedJob
   return { findings, edits, gatedJobIds: visited };
 }
 
+function markJobsGatedByNeedsOutputs(jobs, initiallyGatedJobIds) {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const job of jobs) {
+      if (job.hasOwnerGuard || !jobRequiresGatedNeedsOutput(job, initiallyGatedJobIds)) {
+        continue;
+      }
+      job.hasOwnerGuard = true;
+      initiallyGatedJobIds.add(job.id);
+      changed = true;
+    }
+  }
+}
+
+function jobRequiresGatedNeedsOutput(job, gatedJobIds) {
+  const condition = String(job.parsed?.if || "");
+  if (!condition || !Array.isArray(job.needs) || job.needs.length === 0) {
+    return false;
+  }
+
+  for (const reference of extractNeedsOutputReferencesFromValue(condition, job.parsed?.ifLine || job.startLine)) {
+    if (!gatedJobIds.has(reference.jobId)) {
+      continue;
+    }
+    if (conditionRequiresTrueNeedsOutput(condition, reference)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function conditionRequiresTrueNeedsOutput(condition, reference) {
+  const outputReference = `needs\\s*\\.\\s*${escapeRegExp(reference.jobId)}\\s*\\.\\s*outputs\\s*\\.\\s*${escapeRegExp(reference.outputName)}`;
+  return (
+    new RegExp(`${outputReference}\\s*==\\s*['"]true['"]`, "i").test(condition) ||
+    new RegExp(`['"]true['"]\\s*==\\s*${outputReference}`, "i").test(condition)
+  );
+}
+
 function collectSecretProbeOutputs(job) {
   const probes = new Map();
   for (const step of job.steps || []) {
@@ -1597,8 +1640,13 @@ function detectSecretProbeOutputNames(parsedStep) {
     return [];
   }
 
-  const secretEnvVars = secretBackedEnvVarNames(parsedStep.env);
   const run = String(parsedStep.run || "");
+  const expressionProbeOutputs = detectExpressionSecretProbeOutputNames(run);
+  if (expressionProbeOutputs.length > 0) {
+    return expressionProbeOutputs;
+  }
+
+  const secretEnvVars = secretBackedEnvVarNames(parsedStep.env);
   if (secretEnvVars.length === 0 || !/\bGITHUB_OUTPUT\b/.test(run)) {
     return [];
   }
@@ -1610,6 +1658,32 @@ function detectSecretProbeOutputNames(parsedStep) {
   }
 
   return extractGithubOutputNames(run);
+}
+
+function detectExpressionSecretProbeOutputNames(run) {
+  const names = new Set();
+  for (const line of String(run).split(/\r?\n/)) {
+    if (extractSecretNames(line).length === 0) {
+      continue;
+    }
+    if (!/\bGITHUB_OUTPUT\b/.test(line) || !lineContainsOnlySecretPresenceExpressions(line)) {
+      return [];
+    }
+    const outputNames = extractGithubOutputNames(line);
+    if (outputNames.length === 0) {
+      return [];
+    }
+    for (const outputName of outputNames) {
+      names.add(outputName);
+    }
+  }
+  return [...names];
+}
+
+function lineContainsOnlySecretPresenceExpressions(line) {
+  SECRET_PRESENCE_EXPRESSION_PATTERN.lastIndex = 0;
+  const remainder = String(line).replace(SECRET_PRESENCE_EXPRESSION_PATTERN, "");
+  return extractSecretNames(remainder).length === 0;
 }
 
 function secretBackedEnvVarNames(env) {

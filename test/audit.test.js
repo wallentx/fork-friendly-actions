@@ -304,6 +304,30 @@ jobs:
   assert.deepEqual(findings, []);
 });
 
+test("allows expression secret presence probes and consumers gated by their outputs", () => {
+  const findings = audit(`
+name: Build
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check Secrets
+        id: check_secrets
+        run: |
+          echo "has_win_cert=\${{ secrets.WINDOWS_PFX_BASE64 != '' }}" >> "$GITHUB_OUTPUT"
+          echo "has_mac_cert=\${{ secrets.MACOS_CERT_P12_BASE64 != '' }}" >> "$GITHUB_OUTPUT"
+      - name: Setup Windows Certificate
+        if: "steps.check_secrets.outputs.has_win_cert == 'true' && github.event_name != 'pull_request'"
+        env:
+          PFX_BASE64: "\${{ secrets.WINDOWS_PFX_BASE64 }}"
+          PFX_PASSWORD: "\${{ secrets.WINDOWS_PFX_PASSWORD }}"
+        run: echo setup
+`);
+
+  assert.deepEqual(findings, []);
+});
+
 test("flags secret probes that expose secret values as outputs", () => {
   const findings = audit(`
 name: Build
@@ -321,6 +345,50 @@ jobs:
 
   assert.equal(findings.length, 1);
   assert.equal(findings[0].ruleCode, RULES.SECRET_GATE.code);
+});
+
+test("flags expression secret probes that expose secret values as outputs", () => {
+  const findings = audit(`
+name: Build
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Unsafe secret output
+        id: check_secrets
+        run: echo "api_key=\${{ secrets.GEMINI_API_KEY }}" >> "$GITHUB_OUTPUT"
+`);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].ruleCode, RULES.SECRET_GATE.code);
+});
+
+test("allows jobs gated by outputs from upstream-only needs", () => {
+  const findings = audit(`
+name: Eval
+on: pull_request_target
+jobs:
+  detect-changes:
+    if: github.repository == 'ExampleOrg/example-repo'
+    runs-on: private-runner
+    outputs:
+      SHOULD_RUN: \${{ steps.detect.outputs.SHOULD_RUN }}
+    steps:
+      - id: detect
+        run: echo "SHOULD_RUN=true" >> "$GITHUB_OUTPUT"
+  pr-evaluation:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.SHOULD_RUN == 'true'
+    runs-on: private-runner
+    steps:
+      - name: Execute Regression Check
+        env:
+          GEMINI_API_KEY: "\${{ secrets.GEMINI_API_KEY }}"
+        run: npm run eval
+`);
+
+  assert.deepEqual(findings, []);
 });
 
 test("allows inherited secrets when local reusable workflow secret paths are owner-gated", () => {
