@@ -54,18 +54,6 @@ const RULES = Object.freeze({
   },
 });
 
-const OWNER_GUARD_PATTERNS = [
-  /github\.repository_owner\s*==/,
-  /github\.repository_owner\s*!=/,
-  /github\.repository\s*==/,
-  /github\.repository\s*!=/,
-  /github\.event_name\s*!=\s*['"]pull_request['"]/,
-  /github\.event_name\s*==\s*['"]push['"]/,
-  /github\.event_name\s*==\s*['"]schedule['"]/,
-  /github\.event\.pull_request\.head\.repo\.full_name\s*==\s*github\.repository/,
-  /github\.event\.pull_request\.head\.repo\.fork\s*==\s*false/,
-];
-
 const PUBLISH_USES_PATTERNS = [
   /\bpypa\/gh-action-pypi-publish\b/i,
   /\bdocker\/login-action\b/i,
@@ -217,7 +205,7 @@ function evaluateWorkflows({
   const contextFiles = workflowContextFiles(workflowsPath, files);
   const workflowRoot = inferWorkflowRoot(cwd, workflowsPath);
   const reusableWorkflowInputs = collectReusableWorkflowInputValues({ cwd, workflowRoot, files: contextFiles });
-  const reusableWorkflowSecretSafety = collectReusableWorkflowSecretSafety({ cwd, workflowRoot, files: contextFiles });
+  const reusableWorkflowSecretSafety = collectReusableWorkflowSecretSafety({ cwd, workflowRoot, files: contextFiles, upstreamRepo, upstreamOwner });
   const findings = [];
   const changes = [];
   const fileChanges = [];
@@ -330,7 +318,8 @@ function collectReusableWorkflowInputValues({ cwd, workflowRoot, files }) {
   return valuesByWorkflow;
 }
 
-function collectReusableWorkflowSecretSafety({ cwd, workflowRoot, files }) {
+function collectReusableWorkflowSecretSafety({ cwd, workflowRoot, files, upstreamRepo, upstreamOwner }) {
+  const upstreamScope = normalizeUpstreamScope({ upstreamRepo, upstreamOwner });
   const workflows = new Map();
   for (const filePath of files) {
     let source;
@@ -341,7 +330,7 @@ function collectReusableWorkflowSecretSafety({ cwd, workflowRoot, files }) {
     }
     workflows.set(normalizePathSeparators(path.relative(cwd, filePath)), {
       filePath,
-      workflowModel: parseWorkflowModel(source),
+      workflowModel: parseWorkflowModel(source, upstreamScope),
     });
   }
 
@@ -472,9 +461,9 @@ function evaluateWorkflowFile({
   const lines = source.split(/\r?\n/);
   const findings = [];
   const edits = [];
-  const workflowModel = parseWorkflowModel(source);
-  const jobs = buildJobsFromWorkflowModel(workflowModel, lines);
   const upstreamScope = normalizeUpstreamScope({ upstreamRepo, upstreamOwner });
+  const workflowModel = parseWorkflowModel(source, upstreamScope);
+  const jobs = buildJobsFromWorkflowModel(workflowModel, lines);
   const workflowInputValues = reusableWorkflowInputs.get(normalizePathSeparators(relativeFile)) || new Map();
   const initiallyGatedJobIds = new Set();
   const outputBlockedJobIds = new Set();
@@ -863,7 +852,7 @@ function buildJobsFromWorkflowModel(workflowModel, lines) {
   });
 }
 
-function parseWorkflowModel(source) {
+function parseWorkflowModel(source, upstreamScope = {}) {
   const lineCounter = new YAML.LineCounter();
   let document;
   try {
@@ -912,7 +901,7 @@ function parseWorkflowModel(source) {
       const withValue = yamlNodeToJSON(withPair && withPair.value);
       const secretsValue = yamlNodeToJSON(secretsPair && secretsPair.value);
       const outputs = parseJobOutputs(outputsPair && outputsPair.value, lineCounter);
-      const steps = parseJobSteps(stepsPair && stepsPair.value, lineCounter);
+      const steps = parseJobSteps(stepsPair && stepsPair.value, lineCounter, upstreamScope, source);
       const runsOn = parseRunsOnNode(runsOnPair, lineCounter, source);
       const matrix = parseMatrixConfig(strategyPair && strategyPair.value);
 
@@ -926,7 +915,9 @@ function parseWorkflowModel(source) {
         snapshotLine: yamlNodeLine(lineCounter, snapshotPair && snapshotPair.key),
         if: ifValue,
         ifLine: yamlNodeLine(lineCounter, ifPair && ifPair.key),
-        hasOwnerGuard: containsOwnerGuard(ifValue),
+        ifEndLine: yamlNodeEndLine(lineCounter, ifPair && ifPair.value),
+        ifPrefix: yamlNodeLinePrefix(source, ifPair && ifPair.key),
+        hasOwnerGuard: containsOwnerGuard(ifValue, upstreamScope),
         uses: usesValue,
         usesLine: yamlNodeLine(lineCounter, usesPair && usesPair.key),
         secrets: secretsValue,
@@ -1079,7 +1070,7 @@ function parseJobOutputs(outputsNode, lineCounter) {
   });
 }
 
-function parseJobSteps(stepsNode, lineCounter) {
+function parseJobSteps(stepsNode, lineCounter, upstreamScope, source) {
   if (!stepsNode || !Array.isArray(stepsNode.items)) {
     return [];
   }
@@ -1114,7 +1105,9 @@ function parseJobSteps(stepsNode, lineCounter) {
       endLine: yamlNodeEndLine(lineCounter, stepNode) || stepLine,
       if: ifValue,
       ifLine: yamlNodeLine(lineCounter, ifPair && ifPair.key),
-      hasOwnerGuard: containsOwnerGuard(ifValue),
+      ifEndLine: yamlNodeEndLine(lineCounter, ifPair && ifPair.value),
+      ifPrefix: yamlNodeLinePrefix(source, ifPair && ifPair.key),
+      hasOwnerGuard: containsOwnerGuard(ifValue, upstreamScope),
       uses: usesValue,
       usesLine: yamlNodeLine(lineCounter, usesPair && usesPair.key),
       run: runValue,
@@ -1309,6 +1302,12 @@ function yamlNodeEndLine(lineCounter, node) {
   return position && typeof position.line === "number" ? position.line : 0;
 }
 
+function yamlNodeLinePrefix(source, node) {
+  if (!node || !Array.isArray(node.range)) return undefined;
+  const offset = node.range[0];
+  return source.slice(source.lastIndexOf("\n", offset - 1) + 1, offset);
+}
+
 function yamlNodeText(source, node) {
   if (!node || !Array.isArray(node.range) || typeof node.range[0] !== "number" || typeof node.range[1] !== "number") {
     return "";
@@ -1331,8 +1330,100 @@ function normalizeNeedsNode(node) {
   return [];
 }
 
-function containsOwnerGuard(value) {
-  return OWNER_GUARD_PATTERNS.some((pattern) => pattern.test(String(value || "")));
+// Split only at the expression's top level. Quoted text and function arguments
+// cannot establish a guard, even when they contain repository comparisons.
+function splitCondition(value, operator) {
+  const parts = [];
+  const stack = [];
+  let quoted = false;
+  let start = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (char === "'") {
+      if (quoted && value[index + 1] === "'") {
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (quoted) continue;
+    if (char === "(" || char === "[") {
+      stack.push(char);
+    } else if (char === ")" || char === "]") {
+      if (stack.pop() !== (char === ")" ? "(" : "[")) return null;
+    } else if (stack.length === 0 && value.startsWith(operator, index)) {
+      parts.push(value.slice(start, index).trim());
+      index += operator.length - 1;
+      start = index + 1;
+    }
+  }
+  if (quoted || stack.length > 0) return null;
+  parts.push(value.slice(start).trim());
+  return parts.every(Boolean) ? parts : null;
+}
+
+function conditionString(value) {
+  return /^'(?:[^']|'')*'$/.test(value) ? value.slice(1, -1).replace(/''/g, "'") : null;
+}
+
+// Three-valued analysis: null means unknown, never "safe". We only suppress a
+// finding when the complete condition is provably false outside the upstream
+// repository/owner. Event and PR-origin checks do not impose that restriction.
+function conditionOnFork(value, upstreamScope, depth = 0) {
+  const expression = stripExpressionDelimiters(value);
+  if (!expression || depth > 64 || expression.length > 16384) return null;
+  // Remaining delimiters indicate mixed interpolation, whose literal operators
+  // are text rather than Boolean operators. Reject it before splitting.
+  if (expression.includes("${{") || expression.includes("}}")) return null;
+  for (const operator of ["||", "&&"]) {
+    const parts = splitCondition(expression, operator);
+    if (!parts) return null;
+    if (parts.length > 1) {
+      const values = parts.map((part) => conditionOnFork(part, upstreamScope, depth + 1));
+      if (operator === "||") {
+        return values.includes(true) ? true : values.every((value) => value === false) ? false : null;
+      }
+      return values.includes(false) ? false : values.every((value) => value === true) ? true : null;
+    }
+  }
+  if (expression.startsWith("(") && expression.endsWith(")")) {
+    return conditionOnFork(expression.slice(1, -1), upstreamScope, depth + 1);
+  }
+  for (const operator of ["==", "!="]) {
+    const parts = splitCondition(expression, operator);
+    if (!parts) return null;
+    if (parts.length > 1) {
+      if (parts.length !== 2) return null;
+      for (const [reference, literal] of [parts, [...parts].reverse()]) {
+        const expected = conditionString(literal);
+        if (!expected) continue;
+        const identity = reference.toLowerCase();
+        const upstream = identity === "github.repository" ? upstreamScope.upstreamRepo
+          : identity === "github.repository_owner" ? upstreamScope.upstreamOwner : undefined;
+        if (identity !== "github.repository" && identity !== "github.repository_owner") continue;
+        // Without an explicit scope, the literal itself declares the boundary.
+        const matchesOwnerScope = identity !== "github.repository" || upstreamScope.upstreamRepo
+          || !upstreamScope.upstreamOwner
+          || expected.toLowerCase().startsWith(`${upstreamScope.upstreamOwner.toLowerCase()}/`);
+        if (matchesOwnerScope && (!upstream || upstream.toLowerCase() === expected.toLowerCase())) {
+          return operator === "!=";
+        }
+      }
+      return null;
+    }
+  }
+  if (expression.startsWith("!")) {
+    const result = conditionOnFork(expression.slice(1), upstreamScope, depth + 1);
+    return result === null ? null : !result;
+  }
+  if (/^(false|null|0)$/i.test(expression) || expression === "''") return false;
+  if (/^true$/i.test(expression) || conditionString(expression)) return true;
+  return null;
+}
+
+function containsOwnerGuard(value, upstreamScope = {}) {
+  return conditionOnFork(String(value ?? ""), upstreamScope) === false;
 }
 
 function collectStringValues(value) {
@@ -1833,15 +1924,14 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, workflowModel, w
   if (runsOn.isExpression) {
     const raw = runsOn.raw;
     const expression = stripExpressionDelimiters(raw);
-    const hasOwnerExpression = OWNER_GUARD_PATTERNS.some((pattern) => pattern.test(raw));
-    const hasFallback = /&&/.test(raw) && /\|\|/.test(raw);
     const matrixResolution = resolveMatrixRunnerExpression(
       raw,
       guard?.matrixValues || {},
       guard?.matrixExcludes || [],
       allowList,
       workflowInputValues,
-      workflowModel?.workflowCallInputs || {}
+      workflowModel?.workflowCallInputs || {},
+      upstreamScope
     );
     const expressionFallback = buildMatrixFallbackExpression(expression, guard?.matrixValues || {}, guard?.matrixExcludes || [], allowList);
     if (guard?.hasOwnerGuard) {
@@ -1869,7 +1959,7 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, workflowModel, w
         ],
       };
     }
-    if (!hasOwnerExpression || !hasFallback) {
+    if (!isGuardedRunnerFallback(expression, allowList, upstreamScope, guard?.matrixValues || {}, guard?.matrixExcludes || [])) {
       // A single default cannot preserve an unresolved matrix's OS/architecture.
       // Leave it for manual review instead of silently collapsing every leg.
       const needsManualFallback = /\bmatrix\s*(?:\.|\[)/.test(expression) && !expressionFallback;
@@ -1955,14 +2045,14 @@ function makeRunsOnEdit({ lines, runsOn, upstreamScope, runnerFallback, preferre
   };
 }
 
-function resolveMatrixRunnerExpression(raw, matrixValues, matrixExcludes, allowList, workflowInputValues = new Map(), workflowCallInputs = {}) {
+function resolveMatrixRunnerExpression(raw, matrixValues, matrixExcludes, allowList, workflowInputValues = new Map(), workflowCallInputs = {}, upstreamScope = {}) {
   const expression = stripExpressionDelimiters(raw);
   const simpleReferences = extractMatrixReferences(expression);
 
   if (simpleReferences.length === 0) {
     const inputValues = resolveWorkflowCallInputRunnerValues(expression, workflowInputValues, workflowCallInputs);
     if (inputValues.length > 0) {
-      return summarizeResolvedRunnerValues(inputValues, allowList, []);
+      return summarizeResolvedRunnerValues(inputValues, allowList, [], upstreamScope);
     }
     return { isKnownPublic: false };
   }
@@ -1981,13 +2071,13 @@ function resolveMatrixRunnerExpression(raw, matrixValues, matrixExcludes, allowL
     return { isKnownPublic: false, referencedKeys: simpleReferences, resolvedValues };
   }
 
-  return summarizeResolvedRunnerValues(expandedValues, allowList, simpleReferences);
+  return summarizeResolvedRunnerValues(expandedValues, allowList, simpleReferences, upstreamScope);
 }
 
-function summarizeResolvedRunnerValues(resolvedValues, allowList, referencedKeys) {
+function summarizeResolvedRunnerValues(resolvedValues, allowList, referencedKeys, upstreamScope) {
   return {
     isKnownPublic: resolvedValues.length > 0 && resolvedValues.every((value) => isPublicRunnerValue(value, allowList)),
-    isForkFriendly: resolvedValues.length > 0 && resolvedValues.every((value) => isForkFriendlyRunnerValue(value, allowList)),
+    isForkFriendly: resolvedValues.length > 0 && resolvedValues.every((value) => isForkFriendlyRunnerValue(value, allowList, upstreamScope)),
     hasSelfHosted: hasSelfHostedRunner(resolvedValues),
     hasGroup: resolvedValues.some((value) => typeof value === "object" && value && value.group),
     referencedKeys,
@@ -2299,15 +2389,50 @@ function isPublicRunnerValue(value, allowList) {
   return typeof value === "string" && isPublicRunner(value, allowList);
 }
 
-function isForkFriendlyRunnerValue(value, allowList) {
+function isForkFriendlyRunnerValue(value, allowList, upstreamScope) {
   if (isPublicRunnerValue(value, allowList)) {
     return true;
   }
   if (typeof value !== "string") {
     return false;
   }
-  const expression = stripExpressionDelimiters(value);
-  return OWNER_GUARD_PATTERNS.some((pattern) => pattern.test(expression)) && /&&/.test(expression) && /\|\|/.test(expression);
+  return isGuardedRunnerFallback(value, allowList, upstreamScope);
+}
+
+function isGuardedRunnerFallback(value, allowList, upstreamScope = {}, matrixValues = {}, matrixExcludes = []) {
+  let expression = stripExpressionDelimiters(value);
+  if (expression.length > 16384) return false;
+  // Only unwrap parentheses enclosing the complete expression.
+  for (let depth = 0; depth < 64 && expression.startsWith("(") && expression.endsWith(")") && splitCondition(expression.slice(1, -1), "||"); depth += 1) {
+    expression = expression.slice(1, -1).trim();
+  }
+  const branches = splitCondition(expression, "||");
+  if (!branches || branches.length < 2) return false;
+  const firstForkBranch = branches.findIndex((branch) => !containsOwnerGuard(branch, upstreamScope));
+  if (firstForkBranch < 1) return false;
+  const fallback = branches.slice(firstForkBranch).join(" || ");
+  let firstFallback = branches[firstForkBranch];
+  for (let depth = 0; depth < 64 && firstFallback.startsWith("(") && firstFallback.endsWith(")") && splitCondition(firstFallback.slice(1, -1), "||"); depth += 1) {
+    firstFallback = firstFallback.slice(1, -1).trim();
+  }
+  const literal = conditionString(firstFallback);
+  // A non-empty public label short-circuits any later OR branches.
+  if (literal && isPublicRunner(literal, allowList)) return true;
+  const array = firstFallback.match(/^fromJSON\(\s*('(?:[^']|'')*')\s*\)$/i);
+  if (array) {
+    try {
+      const labels = JSON.parse(conditionString(array[1]));
+      return Array.isArray(labels) && isPublicRunnerValue(labels, allowList);
+    } catch {
+      return false;
+    }
+  }
+  // Recognize the value-aware matrix fallbacks emitted by the fixer. Unknown
+  // alternatives must not inherit safety from an unrelated repository check.
+  return extractMatrixReferences(fallback).some((reference) => {
+    const expected = buildMatrixFallbackExpression(reference, matrixValues, matrixExcludes, allowList);
+    return expected && fallback === expected;
+  });
 }
 
 function stripExpressionDelimiters(value) {
@@ -2331,6 +2456,8 @@ function makeOwnerGuardEdit({ step, job, upstreamScope }) {
   if (step && !step.hasOwnerGuard) {
     const existingIfEdit = makeGuardedIfEdit({
       ifLine: step.parsed && step.parsed.ifLine,
+      ifEndLine: step.parsed && step.parsed.ifEndLine,
+      ifPrefix: step.parsed && step.parsed.ifPrefix,
       ifValue: step.parsed && step.parsed.if,
       indent: step.indent + 2,
       upstreamScope,
@@ -2353,6 +2480,8 @@ function makeOwnerGuardEdit({ step, job, upstreamScope }) {
   if (job && !job.hasOwnerGuard) {
     const existingIfEdit = makeGuardedIfEdit({
       ifLine: job.parsed && job.parsed.ifLine,
+      ifEndLine: job.parsed && job.parsed.ifEndLine,
+      ifPrefix: job.parsed && job.parsed.ifPrefix,
       ifValue: job.parsed && job.parsed.if,
       indent: job.bodyIndent,
       upstreamScope,
@@ -2375,7 +2504,7 @@ function makeOwnerGuardEdit({ step, job, upstreamScope }) {
   return null;
 }
 
-function makeGuardedIfEdit({ ifLine, ifValue, indent, upstreamScope, title, key }) {
+function makeGuardedIfEdit({ ifLine, ifEndLine, ifPrefix, ifValue, indent, upstreamScope, title, key }) {
   if (!ifLine || !ifValue) {
     return null;
   }
@@ -2385,10 +2514,16 @@ function makeGuardedIfEdit({ ifLine, ifValue, indent, upstreamScope, title, key 
     return null;
   }
 
+  const condition = `${upstreamScope.guardExpression} && (${existingCondition})`;
+  // Keep the replacement on one physical line, including when the original
+  // condition used a literal block. JSON strings are valid YAML scalars.
+  const serializedCondition = condition.includes("\n")
+    ? JSON.stringify(condition)
+    : YAML.stringify(condition, { lineWidth: 0 }).trimEnd();
   return {
     start: ifLine - 1,
-    end: ifLine,
-    replacement: [`${" ".repeat(indent)}if: ${upstreamScope.guardExpression} && (${existingCondition})`],
+    end: ifEndLine || ifLine,
+    replacement: [`${ifPrefix ?? " ".repeat(indent)}if: ${serializedCondition}`],
     title,
     key,
   };

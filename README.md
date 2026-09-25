@@ -209,6 +209,24 @@ These repository guards select fallbacks for workflows running inside a fork.
 A fork PR targeting the upstream repository still runs in the upstream repository
 and retains its original runner selection.
 
+Guard detection checks the complete Boolean condition, including parentheses,
+`!`, `&&`, and `||`. A repository or owner equality must restrict every path
+that could run outside the configured upstream scope. Event filters and PR-origin
+checks alone do not restrict workflows running inside forks.
+
+| Condition | Suppresses runner findings? |
+| --- | --- |
+| `github.repository == 'ExampleOrg/example-repo'` | Yes, for that upstream repository |
+| `github.event_name != 'pull_request'` | No |
+| `github.repository == 'ExampleOrg/example-repo' || true` | No |
+| `github.repository != 'ExampleOrg/example-repo'` | No |
+| `github.repository == 'ExampleOrg/example-repo' && success()` | Yes, for that upstream repository |
+
+Unknown conditions remain reportable; quoted text and function arguments are
+not treated as repository guards. Guarded runner expressions must also provide
+a recognized public fallback. The analysis follows GitHub's
+[expression quoting and Boolean operators](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions).
+
 Self-hosted runner arrays are treated as upstream-only and get a job guard
 instead of a fork fallback:
 
