@@ -181,6 +181,11 @@ becomes:
 runs-on: ${{ github.repository == 'ExampleOrg/example-repo' && 'benchmark' || 'ubuntu-latest' }}
 ```
 
+Recognized scalar runner labels use the same OS/version/architecture mappings
+as matrix labels below, so `blacksmith-32vcpu-ubuntu-2404` falls back to
+`ubuntu-24.04` rather than a floating `ubuntu-latest`. Unrecognized scalar labels
+retain the configured fallback or existing platform heuristic.
+
 Matrix runner expressions get per-value fallbacks that preserve the runner's OS
 and CPU architecture. Existing public and `--allow-runners` labels stay unchanged;
 the matrix's other fields and build steps are preserved. For example:
@@ -198,6 +203,8 @@ and [GitHub's macOS larger runner architectures](https://docs.github.com/en/acti
 and use the committed public-runner list. Both matrix axes and `include` entries
 are supported, along with resolvable nested runner properties. A cross-build's
 target architecture does not override the runner's architecture.
+Generated mapping clauses have a stable label order regardless of matrix row
+order. Previously generated expressions remain accepted.
 
 If any runner value cannot be resolved or mapped to a compatible public runner,
 ffactions leaves the matrix runner expression unchanged and reports `FF002` for
@@ -282,6 +289,15 @@ becomes:
   env:
     TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 ```
+
+Known publishing commands include `npm publish`, `pnpm publish`, and
+`pkg-pr-new publish`, including versioned invocations such as
+`pnpm dlx pkg-pr-new@0.0.75 publish`. Output guards propagate through subsequent
+steps that transform a publisher's outputs. If a job exports those outputs, the
+job is also guarded so dependent jobs skip on forks. Jobs using `always()` that
+read a skipped job's outputs receive an explicit guard. Other `always()` jobs
+are reported for manual review without changing them or propagating a skip
+through them: status checks and cleanup may intentionally run after a skip.
 
 ## Fix Patterns
 

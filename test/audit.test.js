@@ -680,7 +680,7 @@ jobs:
     upstreamRepo: "ExampleOrg/example-repo",
   });
 
-  assert.match(result.fixedSource, /runs-on: \$\{\{ github\.repository == 'ExampleOrg\/example-repo' && 'macos-latest-large' \|\| 'macos-latest' \}\}/);
+  assert.match(result.fixedSource, /runs-on: \$\{\{ github\.repository == 'ExampleOrg\/example-repo' && 'macos-latest-large' \|\| 'macos-26-intel' \}\}/);
   assert.equal(result.changes.length, 1);
 });
 
@@ -1172,6 +1172,8 @@ jobs:
     if: always()
     needs: image
     runs-on: ubuntu-latest
+    env:
+      IMAGE: \${{ needs.image.outputs.image }}
     steps:
       - run: echo test
 `,

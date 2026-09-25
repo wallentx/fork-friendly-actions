@@ -44,7 +44,7 @@ const RULES = Object.freeze({
     code: "FF006",
     slug: "needs-gate",
     title: "Dependent job bypasses upstream-only skip",
-    description: "Jobs with conditions like always() can run even when an upstream-only dependency is skipped, so those bypasses should be upstream-gated.",
+    description: "Jobs with conditions like always() can run after upstream-only dependencies are skipped. Gate output consumers; review other bypasses manually because they may be status or cleanup jobs.",
   },
   OUTPUT_GATE: {
     code: "FF007",
@@ -65,7 +65,8 @@ const PUBLISH_USES_PATTERNS = [
 ];
 
 const PUBLISH_RUN_PATTERNS = [
-  /\bnpm\s+publish\b/i,
+  /\b(?:npm|pnpm)\s+publish\b/i,
+  /\bpkg-pr-new(?:@[^\s]+)?\s+publish\b/i,
   /\btwine\s+upload\b/i,
   /\bdocker\s+push\b/i,
   /\bgh\s+release\s+(create|upload|edit|delete)\b/i,
@@ -75,7 +76,7 @@ const GITHUB_CLI_COMMAND_PATTERN = /\bgh\s+[^\s&|;]+/i;
 const PULL_REQUEST_EVENTS = new Set(["pull_request", "pull_request_target"]);
 
 const STEP_OUTPUT_REFERENCE_PATTERN = /\bsteps\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
-const NEEDS_OUTPUT_REFERENCE_PATTERN = /\bneeds\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
+const NEEDS_OUTPUT_REFERENCE_PATTERN = /\bneeds\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_-]*)|\[\s*'([A-Za-z_][A-Za-z0-9_-]*)'\s*\])\s*(?:\.\s*outputs\b|\[\s*'outputs'\s*\])(?:\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_-]*)|\[\s*'((?:[^']|'')+)'\s*\]))?/g;
 const JOB_OUTPUT_REFERENCE_PATTERN = /\bjobs\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\b/g;
 const SECRET_PRESENCE_EXPRESSION_PATTERN = /\$\{\{\s*secrets\.[A-Za-z_][A-Za-z0-9_]*\s*(?:!=|==)\s*(?:""|'')\s*\}\}/g;
 
@@ -708,6 +709,10 @@ function evaluateWorkflowFile({
           message: `This step reads outputs from ${[...new Set(referencedGatedSteps)].join(", ")}, which ${referencedGatedSteps.length === 1 ? "is" : "are"} upstream-only or skipped on forks. Output consumers should also be skipped on forks.${formatScopeHint(upstreamScope)}`,
           fixable: stepEdit != null,
         });
+        // Later steps and job outputs can depend on this consumer's outputs too.
+        if (step.parsed.id) {
+          gatedStepIds.add(step.parsed.id);
+        }
         if (mode === "fix" && stepEdit) {
           edits.push(stepEdit);
         }
@@ -932,6 +937,8 @@ function parseWorkflowModel(source, upstreamScope = {}) {
         outputsLine: yamlNodeLine(lineCounter, outputsPair && outputsPair.key),
         steps,
         runsOn,
+        // Keep dynamic expressions that cannot be resolved into matrix values.
+        strategy: yamlNodeToJSON(strategyPair && strategyPair.value),
         matrixValues: matrix.values,
         matrixExcludes: matrix.excludes,
       });
@@ -1477,8 +1484,8 @@ function extractJobOutputReferencesFromValue(value, line = 0) {
 
 function extractNeedsOutputReferencesFromValue(value, line = 0) {
   return extractReferencesFromValue(value, line, NEEDS_OUTPUT_REFERENCE_PATTERN, (match, refLine) => ({
-    jobId: match[1],
-    outputName: match[2],
+    jobId: match[1] || match[2],
+    outputName: match[3] || (match[4] ? match[4].replace(/''/g, "'") : null),
     line: refLine,
   }));
 }
@@ -1568,7 +1575,7 @@ function makePublishLocation(lines, line) {
   return findPatternLocation(
     lines[Math.max(line - 1, 0)] || "",
     line,
-    /\b(npm\s+publish|twine\s+upload|docker\s+push|gh\s+release\s+(create|upload|edit|delete)|uses:|run:)\b/i
+    /\b((?:npm|pnpm)\s+publish|pkg-pr-new(?:@[^\s]+)?\s+publish|twine\s+upload|docker\s+push|gh\s+release\s+(create|upload|edit|delete)|uses:|run:)\b/i
   );
 }
 
@@ -1628,38 +1635,49 @@ function collectNeedsPropagationFindings({ jobs, reverseNeeds, initiallyGatedJob
       if (visited.has(dependentId)) {
         continue;
       }
-      visited.add(dependentId);
-      queue.push(dependentId);
-
       const job = jobs.find((entry) => entry.id === dependentId);
       if (!job) {
         continue;
       }
-
-      if (job.hasOwnerGuard || !jobBypassesSkippedNeeds(job)) {
+      // Status/cleanup jobs deliberately bypass skipped prerequisites. Without
+      // an output dependency, do not assume they or their dependents must skip.
+      if (!job.hasOwnerGuard && jobBypassesSkippedNeeds(job) && !jobReadsGatedNeedsOutput(job, visited)) {
         continue;
       }
+      visited.add(dependentId);
+      queue.push(dependentId);
+    }
+  }
 
-      const gatedNeeds = (job.needs || []).filter((need) => visited.has(need));
-      const jobEdit = makeOwnerGuardEdit({ step: null, job, upstreamScope });
-      findings.push({
-        severity: "warning",
-        file: job.relativeFile,
-        line: job.parsed.needsLine || job.startLine,
-        location: makeKeyLocation(lines || [], job.parsed.needsLine || job.startLine, "needs:"),
-        rule: RULES.NEEDS_GATE.slug,
-        ruleCode: RULES.NEEDS_GATE.code,
-        title: RULES.NEEDS_GATE.title,
-        message: `This job depends on ${gatedNeeds.join(", ")}, which ${gatedNeeds.length === 1 ? "is" : "are"} upstream-only or skipped on forks, but its job-level condition can bypass the default needs skip behavior.${formatScopeHint(upstreamScope)}`,
-        fixable: jobEdit != null,
-      });
-      if (jobEdit) {
-        edits.push(jobEdit);
-      }
+  for (const job of jobs) {
+    if (job.hasOwnerGuard || !jobBypassesSkippedNeeds(job)) continue;
+    const gatedNeeds = (job.needs || []).filter((need) => visited.has(need));
+    if (gatedNeeds.length === 0) continue;
+    const readsOutput = jobReadsGatedNeedsOutput(job, visited);
+    const jobEdit = readsOutput ? makeOwnerGuardEdit({ step: null, job, upstreamScope }) : null;
+    findings.push({
+      severity: "warning",
+      file: job.relativeFile,
+      line: job.parsed.needsLine || job.startLine,
+      location: makeKeyLocation(lines || [], job.parsed.needsLine || job.startLine, "needs:"),
+      rule: RULES.NEEDS_GATE.slug,
+      ruleCode: RULES.NEEDS_GATE.code,
+      title: RULES.NEEDS_GATE.title,
+      message: `This job depends on ${gatedNeeds.join(", ")}, which ${gatedNeeds.length === 1 ? "is" : "are"} upstream-only or skipped on forks, but its job-level condition can bypass the default needs skip behavior.${readsOutput ? " It reads outputs from a skipped dependency." : " No output dependency was found; review manually and preserve intentional status or cleanup jobs."}${formatScopeHint(upstreamScope)}`,
+      fixable: jobEdit != null,
+    });
+    if (jobEdit) {
+      edits.push(jobEdit);
     }
   }
 
   return { findings, edits, gatedJobIds: visited };
+}
+
+function jobReadsGatedNeedsOutput(job, gatedJobIds) {
+  return extractNeedsOutputReferencesFromValue(job.parsed || {}).some(
+    (reference) => gatedJobIds.has(reference.jobId)
+  );
 }
 
 function markJobsGatedByNeedsOutputs(jobs, initiallyGatedJobIds) {
@@ -1695,6 +1713,8 @@ function jobRequiresGatedNeedsOutput(job, gatedJobIds) {
 }
 
 function conditionRequiresTrueNeedsOutput(condition, reference) {
+  // Reading the output object does not establish a named Boolean output gate.
+  if (!reference.outputName) return false;
   const outputReference = `needs\\s*\\.\\s*${escapeRegExp(reference.jobId)}\\s*\\.\\s*outputs\\s*\\.\\s*${escapeRegExp(reference.outputName)}`;
   return (
     new RegExp(`${outputReference}\\s*==\\s*['"]true['"]`, "i").test(condition) ||
@@ -2145,6 +2165,10 @@ function hasSelfHostedRunner(labels) {
 }
 
 function inferEquivalentPublicRunner(labels) {
+  if (labels.length === 1) {
+    const mapped = mapForkFriendlyRunner(labels[0], new Set());
+    if (mapped) return mapped;
+  }
   const normalized = labels.map((label) => String(label).trim().toLowerCase());
   if (normalized.some((label) => label.startsWith("macos-") || label.includes("macos"))) {
     return "macos-latest";
@@ -2289,7 +2313,9 @@ function buildMatrixScalarFallbackExpression(reference, values, allowList) {
     return "";
   }
 
-  const changedMappings = [...new Map(mappings)].filter(([original, mapped]) => original !== mapped);
+  const changedMappings = [...new Map(mappings)]
+    .filter(([original, mapped]) => original !== mapped)
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
   if (changedMappings.length === 0) {
     return reference;
   }
@@ -2431,8 +2457,20 @@ function isGuardedRunnerFallback(value, allowList, upstreamScope = {}, matrixVal
   // alternatives must not inherit safety from an unrelated repository check.
   return extractMatrixReferences(fallback).some((reference) => {
     const expected = buildMatrixFallbackExpression(reference, matrixValues, matrixExcludes, allowList);
-    return expected && fallback === expected;
+    return expected && equivalentMatrixFallback(fallback, expected);
   });
+}
+
+function equivalentMatrixFallback(actual, expected) {
+  if (actual === expected) return true;
+  // Older fixes emitted mutually exclusive equality clauses in matrix order.
+  // Accept those permutations, but require the exact known clauses and tail.
+  if (!actual.startsWith("(") || !actual.endsWith(")") || !expected.startsWith("(") || !expected.endsWith(")")) return false;
+  const actualClauses = splitCondition(actual.slice(1, -1), "||");
+  const expectedClauses = splitCondition(expected.slice(1, -1), "||");
+  if (!actualClauses || !expectedClauses || actualClauses.length !== expectedClauses.length) return false;
+  if (actualClauses.pop() !== expectedClauses.pop()) return false;
+  return JSON.stringify(actualClauses.sort()) === JSON.stringify(expectedClauses.sort());
 }
 
 function stripExpressionDelimiters(value) {

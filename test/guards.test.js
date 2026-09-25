@@ -132,7 +132,7 @@ test("tagpr keeps its event filter and gets the right runner on fork pushes and 
       // These trusted fixture expressions use the same operators in JS/Actions.
       assert.equal(vm.runInNewContext(fixed.if, context), event_name !== "pull_request");
       assert.equal(vm.runInNewContext(fixed["runs-on"].slice(3, -2), context),
-        repository === scope.upstreamRepo ? "blacksmith-32vcpu-ubuntu-2404" : "ubuntu-latest");
+        repository === scope.upstreamRepo ? "blacksmith-32vcpu-ubuntu-2404" : "ubuntu-24.04");
     }
   }
 });
