@@ -181,6 +181,34 @@ becomes:
 runs-on: ${{ github.repository == 'ExampleOrg/example-repo' && 'benchmark' || 'ubuntu-latest' }}
 ```
 
+Matrix runner expressions get per-value fallbacks that preserve the runner's OS
+and CPU architecture. Existing public and `--allow-runners` labels stay unchanged;
+the matrix's other fields and build steps are preserved. For example:
+
+| Matrix runner | Fork fallback |
+| --- | --- |
+| `blacksmith-32vcpu-ubuntu-2404` | `ubuntu-24.04` |
+| `blacksmith-32vcpu-ubuntu-2404-arm` | `ubuntu-24.04-arm` |
+| `blacksmith-12vcpu-macos-26` | `macos-26` |
+| `blacksmith-32vcpu-windows-2025` | `windows-2025` |
+| `macos-15-intel` / `windows-11-arm` | unchanged |
+
+Mappings follow [Blacksmith's documented runner families](https://docs.blacksmith.sh/blacksmith-runners/overview)
+and [GitHub's macOS larger runner architectures](https://docs.github.com/en/actions/reference/runners/larger-runners),
+and use the committed public-runner list. Both matrix axes and `include` entries
+are supported, along with resolvable nested runner properties. A cross-build's
+target architecture does not override the runner's architecture.
+
+If any runner value cannot be resolved or mapped to a compatible public runner,
+ffactions leaves the matrix runner expression unchanged and reports `FF002` for
+manual review, including during `--dry-run`. `--runner-fallback` does not replace
+unresolved matrices with one runner. Self-hosted matrices still get upstream-only
+job guards.
+
+These repository guards select fallbacks for workflows running inside a fork.
+A fork PR targeting the upstream repository still runs in the upstream repository
+and retains its original runner selection.
+
 Self-hosted runner arrays are treated as upstream-only and get a job guard
 instead of a fork fallback:
 

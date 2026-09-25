@@ -1091,6 +1091,14 @@ function printResult(result, { fixMode, cwd, dryRun }) {
       console.log("No fixable changes found.");
     }
     console.log(`Would apply ${result.changes.length} change${result.changes.length === 1 ? "" : "s"} across ${result.changedFiles.length} file${result.changedFiles.length === 1 ? "" : "s"}.`);
+    const manualFindings = result.findings.filter((finding) => !finding.fixable);
+    if (manualFindings.length > 0) {
+      console.log("");
+      console.log("Manual review required:");
+      for (const finding of manualFindings) {
+        console.log(`${finding.file}:${finding.line}: ${finding.ruleCode} ${finding.message}`);
+      }
+    }
     return;
   }
 

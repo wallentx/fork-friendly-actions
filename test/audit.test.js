@@ -1232,7 +1232,7 @@ jobs:
   assert.match(result.fixedSource, /- self-hosted/);
 });
 
-test("fixes dynamic runner expressions with an owner-gated public fallback", () => {
+test("leaves unresolved matrix runner expressions for manual review", () => {
   const result = fixWorkflowFile({
     filePath: "/repo/.github/workflows/ci.yml",
     source: `
@@ -1248,9 +1248,10 @@ jobs:
     upstreamOwner: "ExampleOrg",
   });
 
-  assert.match(result.fixedSource, /runs-on: \$\{\{ github\.repository_owner == 'ExampleOrg' && \(matrix\.runs_on \|\| matrix\.runner\) \|\| 'ubuntu-latest' \}\}/);
-  assert.equal(result.changes.length, 1);
-  assert.equal(result.findings[0].fixable, true);
+  assert.match(result.fixedSource, /runs-on: \$\{\{ matrix\.runs_on \|\| matrix\.runner \}\}/);
+  assert.equal(result.changes.length, 0);
+  assert.equal(result.findings[0].fixable, false);
+  assert.match(result.findings[0].message, /configure OS\/architecture-compatible fallbacks manually/);
   assert.equal(result.findings[0].ruleCode, RULES.RUNNER_EXPRESSION.code);
 });
 
@@ -1307,7 +1308,7 @@ jobs:
 
   assert.match(
     result.fixedSource,
-    /runs-on: \$\{\{ github\.repository == 'ExampleOrg\/example-repo' && \(matrix\.os\) \|\| \(matrix\.os == 'macos-15-xlarge' && 'macos-latest' \|\| matrix\.os\) \}\}/
+    /runs-on: \$\{\{ github\.repository == 'ExampleOrg\/example-repo' && \(matrix\.os\) \|\| \(matrix\.os == 'macos-15-xlarge' && 'macos-15' \|\| matrix\.os\) \}\}/
   );
 });
 
@@ -1436,7 +1437,7 @@ jobs:
 
   assert.match(
     result.fixedSource,
-    /runs-on: \$\{\{ github\.repository == 'ExampleOrg\/example-repo' && \(matrix\.os\.runs-on\) \|\| \(matrix\.os\.runs-on == 'macos-15-xlarge' && 'macos-latest' \|\| matrix\.os\.runs-on\) \}\}/
+    /runs-on: \$\{\{ github\.repository == 'ExampleOrg\/example-repo' && \(matrix\.os\.runs-on\) \|\| \(matrix\.os\.runs-on == 'macos-15-xlarge' && 'macos-15' \|\| matrix\.os\.runs-on\) \}\}/
   );
 });
 
