@@ -28,6 +28,9 @@ for (const command of [
   "npx pkg-pr-new@latest publish",
   "npx pkg-pr-new publish",
   "pkg-pr-new publish",
+  "pnpm publish; echo complete",
+  "pnpm publish&&echo complete",
+  "pkg-pr-new publish>publish.log",
 ]) {
   test(`gates publisher: ${command}`, () => {
     const source = workflow(command);
@@ -46,8 +49,13 @@ test("does not flag package installation, packing, or unrelated commands", () =>
   for (const command of [
     "pnpm install --frozen-lockfile", "pnpm pack", "pnpm dlx pkg-pr-new --help",
     "npx pkg-pr-new@0.0.75 --version", "pnpm dlx another-tool publish",
+    "pnpm publish:docs", "pnpm publish-preview", "pnpm publish_docs",
+    "pnpm run publish:docs", "pnpm dlx pkg-pr-new publish-preview",
+    "pkg-pr-new publish:docs",
   ]) {
-    assert.deepEqual(auditWorkflowFile({ ...scope, source: workflow(command) }), [], command);
+    const source = workflow(command);
+    assert.deepEqual(auditWorkflowFile({ ...scope, source }), [], command);
+    assert.equal(fixWorkflowFile({ ...scope, source }).fixedSource, source, command);
   }
 });
 
@@ -98,6 +106,11 @@ for (const [name, consumerFields] of [
   ["whole output object", { env: { DATA: "${{ toJSON(needs.publish.outputs) }}" } }],
   ["indexed output object", { env: { DATA: "${{ toJSON(needs['publish']['outputs']) }}" } }],
   ["output object in condition", { if: "always() && toJSON(needs.publish.outputs)" }],
+  ["container image", { container: { image: "${{ needs.publish.outputs.image }}" } }],
+  ["service image", { services: { database: { image: "${{ needs.publish.outputs.image }}" } } }],
+  ["concurrency group", { concurrency: { group: "${{ needs.publish.outputs.group }}" } }],
+  ["timeout", { "timeout-minutes": "${{ fromJSON(needs.publish.outputs.minutes) }}" }],
+  ["continue-on-error", { "continue-on-error": "${{ fromJSON(needs.publish.outputs.ignore) }}" }],
 ]) {
   test(`guards an always consumer of a skipped publisher's ${name}`, () => {
     const source = YAML.stringify({
@@ -105,7 +118,10 @@ for (const [name, consumerFields] of [
       jobs: {
         publish: {
           if: upstream, "runs-on": "ubuntu-latest",
-          outputs: { url: "https://example.com", matrix: '{"os":["ubuntu-latest"]}' },
+          outputs: {
+            url: "https://example.com", matrix: '{"os":["ubuntu-latest"]}',
+            image: "alpine:3", group: "consumer", minutes: "10", ignore: "false",
+          },
           steps: [{ run: "echo publish" }],
         },
         consumer: {
@@ -135,6 +151,50 @@ for (const [name, consumerFields] of [
   });
 }
 
+test("preserves equivalent dotted and indexed Boolean output gates", () => {
+  for (const reference of [
+    "needs.publish.outputs.enabled",
+    "needs['publish'].outputs.enabled",
+    "needs.publish['outputs']['enabled']",
+    "needs[ 'publish' ][ 'outputs' ][ 'enabled' ]",
+  ]) {
+    for (const condition of [
+      `always() && ${reference} == 'true'`,
+      `always() && ('true' == ${reference})`,
+    ]) {
+      const source = YAML.stringify({
+        on: "pull_request",
+        jobs: {
+          publish: { if: upstream, "runs-on": "ubuntu-latest", steps: [{ run: "echo publish" }] },
+          consumer: { if: condition, needs: "publish", "runs-on": "ubuntu-latest", steps: [{ run: "echo consume" }] },
+        },
+      });
+      assert.deepEqual(auditWorkflowFile({ ...scope, source }), [], condition);
+      assert.equal(fixWorkflowFile({ ...scope, source }).fixedSource, source, condition);
+    }
+  }
+});
+
+test("Boolean output comparisons cannot suppress findings when bypassed", () => {
+  const reference = "needs['publish']['outputs']['enabled']";
+  for (const condition of [
+    `always() || ${reference} == 'true'`,
+    `always() && (${reference} == 'true' || inputs.force)`,
+    `always() && !(${reference} == 'true')`,
+  ]) {
+    const source = YAML.stringify({
+      on: "pull_request",
+      jobs: {
+        publish: { if: upstream, "runs-on": "ubuntu-latest", steps: [{ run: "echo publish" }] },
+        consumer: { if: condition, needs: "publish", "runs-on": "ubuntu-latest", steps: [{ run: "echo consume" }] },
+      },
+    });
+    const result = fixWorkflowFile({ ...scope, source });
+    assert.deepEqual(result.findings.map((finding) => finding.ruleCode), ["FF006"], condition);
+    assert.equal(YAML.parse(result.fixedSource).jobs.consumer.if, `${upstream} && (${condition})`);
+  }
+});
+
 test("keeps status and timeline jobs running without propagating skips through them", () => {
   const source = YAML.stringify({
     on: { workflow_call: { outputs: { summary: { value: "${{ jobs.report.outputs.summary }}" } } } },
@@ -142,6 +202,7 @@ test("keeps status and timeline jobs running without propagating skips through t
       publish: { if: upstream, "runs-on": "ubuntu-latest", steps: [{ run: "pnpm publish" }] },
       report: {
         if: "always()", needs: "publish", "runs-on": "ubuntu-latest",
+        concurrency: { group: "status-${{ needs.publish.result }}" },
         outputs: { summary: "${{ steps.status.outputs.summary }}" },
         steps: [{ id: "status", env: {
           RESULTS: "${{ join(needs.*.result, ' ') }}",

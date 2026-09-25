@@ -8674,8 +8674,8 @@ const PUBLISH_USES_PATTERNS = [
 ];
 
 const PUBLISH_RUN_PATTERNS = [
-  /\b(?:npm|pnpm)\s+publish\b/i,
-  /\bpkg-pr-new(?:@[^\s]+)?\s+publish\b/i,
+  /\b(?:npm|pnpm)\s+publish(?=$|[\s;&|<>()])/i,
+  /\bpkg-pr-new(?:@[^\s]+)?\s+publish(?=$|[\s;&|<>()])/i,
   /\btwine\s+upload\b/i,
   /\bdocker\s+push\b/i,
   /\bgh\s+release\s+(create|upload|edit|delete)\b/i,
@@ -9546,8 +9546,9 @@ function parseWorkflowModel(source, upstreamScope = {}) {
         outputsLine: yamlNodeLine(lineCounter, outputsPair && outputsPair.key),
         steps,
         runsOn,
-        // Keep dynamic expressions that cannot be resolved into matrix values.
-        strategy: yamlNodeToJSON(strategyPair && strategyPair.value),
+        // Output consumers can appear in any job field, including expressions
+        // that are not retained by the specialized parsers above.
+        definition: yamlNodeToJSON(jobPair.value),
         matrixValues: matrix.values,
         matrixExcludes: matrix.excludes,
       });
@@ -10184,7 +10185,7 @@ function makePublishLocation(lines, line) {
   return findPatternLocation(
     lines[Math.max(line - 1, 0)] || "",
     line,
-    /\b((?:npm|pnpm)\s+publish|pkg-pr-new(?:@[^\s]+)?\s+publish|twine\s+upload|docker\s+push|gh\s+release\s+(create|upload|edit|delete)|uses:|run:)\b/i
+    /\b((?:npm|pnpm)\s+publish(?=$|[\s;&|<>()])|pkg-pr-new(?:@[^\s]+)?\s+publish(?=$|[\s;&|<>()])|twine\s+upload|docker\s+push|gh\s+release\s+(create|upload|edit|delete)|uses:|run:)\b/i
   );
 }
 
@@ -10284,7 +10285,7 @@ function collectNeedsPropagationFindings({ jobs, reverseNeeds, initiallyGatedJob
 }
 
 function jobReadsGatedNeedsOutput(job, gatedJobIds) {
-  return extractNeedsOutputReferencesFromValue(job.parsed || {}).some(
+  return extractNeedsOutputReferencesFromValue(job.parsed?.definition || job.parsed || {}).some(
     (reference) => gatedJobIds.has(reference.jobId)
   );
 }
@@ -10321,13 +10322,31 @@ function jobRequiresGatedNeedsOutput(job, gatedJobIds) {
   return false;
 }
 
-function conditionRequiresTrueNeedsOutput(condition, reference) {
+function conditionRequiresTrueNeedsOutput(condition, reference, depth = 0) {
   // Reading the output object does not establish a named Boolean output gate.
   if (!reference.outputName) return false;
-  const outputReference = `needs\\s*\\.\\s*${escapeRegExp(reference.jobId)}\\s*\\.\\s*outputs\\s*\\.\\s*${escapeRegExp(reference.outputName)}`;
+  const expression = stripExpressionDelimiters(condition);
+  if (!expression || depth > 64 || expression.length > 16384) return false;
+  if (expression.includes("${{") || expression.includes("}}")) return false;
+  // An AND needs only one mandatory gate; every OR branch must require it.
+  for (const operator of ["||", "&&"]) {
+    const parts = splitCondition(expression, operator);
+    if (!parts) return false;
+    if (parts.length > 1) {
+      const requiresOutput = (part) => conditionRequiresTrueNeedsOutput(part, reference, depth + 1);
+      return operator === "||" ? parts.every(requiresOutput) : parts.some(requiresOutput);
+    }
+  }
+  if (expression.startsWith("(") && expression.endsWith(")")) {
+    return conditionRequiresTrueNeedsOutput(expression.slice(1, -1), reference, depth + 1);
+  }
+  const accessors = [reference.jobId, "outputs", reference.outputName].map((name) =>
+    `\\s*(?:\\.\\s*${escapeRegExp(name)}|\\[\\s*'${escapeRegExp(escapeExpressionString(name))}'\\s*\\])`
+  ).join("");
+  const outputReference = `needs${accessors}`;
   return (
-    new RegExp(`${outputReference}\\s*==\\s*['"]true['"]`, "i").test(condition) ||
-    new RegExp(`['"]true['"]\\s*==\\s*${outputReference}`, "i").test(condition)
+    new RegExp(`^${outputReference}\\s*==\\s*['"]true['"]$`, "i").test(expression) ||
+    new RegExp(`^['"]true['"]\\s*==\\s*${outputReference}$`, "i").test(expression)
   );
 }
 
