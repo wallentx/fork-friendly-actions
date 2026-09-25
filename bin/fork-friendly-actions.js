@@ -1441,34 +1441,126 @@ function paintStyle(style, text) {
   return `${codes[style] || ""}${text}\u001b[0m`;
 }
 
+const HELP_OPTION_LABEL_WIDTH = 31;
+const HELP_OPTION_DESC_WIDTH = 54;
+
+function helpColor(className, text) {
+  if (!supportsColor()) {
+    return text;
+  }
+
+  const codes = {
+    heading: "\u001b[1;96m",
+    section: "\u001b[1;94m",
+    label: "\u001b[1;95m",
+    meta: "\u001b[3;90m",
+    valueMeta: "\u001b[3;31m",
+    example: "\u001b[3;90m",
+    literal: "\u001b[1;33m",
+    comma: "\u001b[0;37m",
+    bracket: "\u001b[1;32m",
+    bracketText: "\u001b[3;94m",
+  };
+
+  return `${codes[className] || ""}${text}\u001b[0m`;
+}
+
+function helpBracket(text) {
+  if (!supportsColor()) {
+    return `[${text}]`;
+  }
+
+  return `${helpColor("bracket", "[")}${helpColor("bracketText", text)}${helpColor("bracket", "]")}`;
+}
+
+function helpDefault(text) {
+  if (!supportsColor()) {
+    return `(${text})`;
+  }
+
+  return `${helpColor("meta", "(")}${helpColor("valueMeta", text)}${helpColor("meta", ")")}`;
+}
+
+function helpMeta(text) {
+  return helpColor("meta", text);
+}
+
+function helpLiteral(text) {
+  return helpColor("literal", text);
+}
+
+function wrapHelpText(firstIndent, continuationIndent, width, text) {
+  const words = String(text).split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = "";
+  let lineIndent = firstIndent;
+
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (line && visibleTextWidth(candidate) > width) {
+      lines.push(`${lineIndent}${line}`);
+      line = word;
+      lineIndent = continuationIndent;
+    } else {
+      line = candidate;
+    }
+  }
+
+  lines.push(`${lineIndent}${line}`);
+  return lines.join("\n");
+}
+
+function printHelpOption(labelPlain, label, description) {
+  const continuationIndent = " ".repeat(2 + HELP_OPTION_LABEL_WIDTH + 1);
+
+  if (labelPlain.length >= HELP_OPTION_LABEL_WIDTH) {
+    console.log(`  ${label}`);
+    console.log(wrapHelpText(continuationIndent, continuationIndent, HELP_OPTION_DESC_WIDTH, description));
+    return;
+  }
+
+  const padding = " ".repeat(HELP_OPTION_LABEL_WIDTH - labelPlain.length + 1);
+  console.log(`  ${label}${padding}${wrapHelpText("", continuationIndent, HELP_OPTION_DESC_WIDTH, description)}`);
+}
+
+function helpOption(shortFlag, longFlag, metaPlain, description, meta = "") {
+  let labelPlain = `${shortFlag}, ${longFlag}`;
+  let label = `${helpColor("label", shortFlag)}${helpColor("comma", ",")} ${helpColor("label", longFlag)}`;
+
+  if (metaPlain) {
+    labelPlain += ` ${metaPlain}`;
+    label += ` ${meta || helpMeta(metaPlain)}`;
+  }
+
+  printHelpOption(labelPlain, label, description);
+}
+
 function printHelp() {
-  console.log(`fork-friendly-actions
-
-Evaluate GitHub Actions workflows and make them friendlier to forked PRs.
-
-Usage:
-  fork-friendly-actions [options] [path]
-
-Default upstream scope detection:
-  ffactions detects the upstream repository slug from git remotes.
-  It prefers the upstream remote and falls back to origin.
-
-Options:
-  -f, --fix                   Evaluate workflows and rewrite fixable fork-hostile patterns.
-  -i, --interactive           Review each proposed fix interactively and apply accepted changes.
-  -w, --workflows <path>      Workflow file or directory. Default: ${DEFAULT_WORKFLOWS_DIR}
-  -r, --upstream-repo <slug>  Override the detected upstream repository slug for fork gating.
-  -o, --upstream-owner <name> Override the detected upstream owner when no repo slug is available.
-  -R, --runner-fallback <lbl> Public runner label to use for fork fallbacks. Default: ${DEFAULT_RUNNER_FALLBACK}
-  -a, --allow-runners <lbls>  Comma-separated extra runner labels to treat as fork-friendly.
-  -l, --fail-on <level>       Exit nonzero at error, warning, or none. Default: error (none when --fix is used).
-  -d, --dry-run               Print what would change without writing files.
-  -v, --version               Show the ffactions version.
-  -h, --help                  Show this help.
-
-Arguments:
-  [path]                      Project checkout, workflow directory, or workflow file. Default: current directory.
-`);
+  console.log(helpColor("heading", "ffactions"));
+  console.log(helpColor("example", "Evaluate GitHub Actions workflows and make them friendlier to forked PRs."));
+  console.log("");
+  console.log(helpColor("section", "Usage"));
+  console.log(`  ${helpColor("label", "ffactions")} ${helpBracket("options")} ${helpBracket("path")}`);
+  console.log("");
+  console.log(helpColor("section", "Default upstream scope detection"));
+  console.log(`  ${helpColor("example", "ffactions detects the upstream repository slug from git remotes.")}`);
+  console.log(`  ${helpColor("example", "It prefers the upstream remote and falls back to origin.")}`);
+  console.log("");
+  console.log(helpColor("section", "Options"));
+  helpOption("-f", "--fix", "", "Evaluate workflows and rewrite fixable fork-hostile patterns.");
+  helpOption("-i", "--interactive", "", "Review each proposed fix interactively and apply accepted changes.");
+  helpOption("-w", "--workflows", "<path>", `Workflow file or directory ${helpDefault(DEFAULT_WORKFLOWS_DIR)}`);
+  helpOption("-r", "--upstream-repo", "<slug>", "Override the detected upstream repository slug for fork gating.");
+  helpOption("-o", "--upstream-owner", "<name>", "Override the detected upstream owner when no repo slug is available.");
+  helpOption("-R", "--runner-fallback", "<label>", `Public runner label to use for fork fallbacks ${helpDefault(DEFAULT_RUNNER_FALLBACK)}`);
+  helpOption("-a", "--allow-runners", "<labels>", "Comma-separated extra runner labels to treat as fork-friendly.");
+  helpOption("-l", "--fail-on", "<level>", `Exit nonzero at ${helpLiteral("error")}, ${helpLiteral("warning")}, or ${helpLiteral("none")} ${helpDefault("error")}. ${helpLiteral("--fix")} uses ${helpLiteral("none")}.`);
+  helpOption("-d", "--dry-run", "", "Print what would change without writing files.");
+  helpOption("-v", "--version", "", "Show the ffactions version.");
+  helpOption("-h", "--help", "", "Show this help.");
+  console.log("");
+  console.log(helpColor("section", "Arguments"));
+  printHelpOption("[path]", helpBracket("path"), `Project checkout, workflow directory, or workflow file ${helpDefault("current directory")}`);
 }
 
 if (require.main === module) {

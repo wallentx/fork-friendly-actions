@@ -1520,6 +1520,68 @@ test("prints CLI version without auditing workflows", () => {
   assert.equal(result.stderr, "");
 });
 
+test("prints colorized CLI help with styled usage", () => {
+  const result = runCli(["--help"], {
+    FORCE_COLOR: "1",
+    NO_COLOR: "",
+  });
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /^\u001b\[1;96mffactions\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[1;94mUsage\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[1;95mffactions\u001b\[0m \u001b\[1;32m\[\u001b\[0m\u001b\[3;94moptions\u001b\[0m\u001b\[1;32m\]\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[1;94mOptions\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[1;95m-f\u001b\[0m\u001b\[0;37m,\u001b\[0m \u001b\[1;95m--fix\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[1;94mArguments\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[3;31mcurrent directory\u001b\[0m/);
+  assert.equal(result.stderr, "");
+});
+
+test("wraps CLI help at visible widths with aligned continuation lines", () => {
+  for (const env of [
+    { FORCE_COLOR: "1", NO_COLOR: "" },
+    { FORCE_COLOR: "1", NO_COLOR: "1" },
+  ]) {
+    const result = runCli(["--help"], env);
+    const plain = result.stdout.replace(/\u001b\[[0-9;]*m/g, "");
+    const lines = plain.split("\n");
+
+    assert.equal(result.status, 0);
+    assert.equal(result.stderr, "");
+    const fixIndex = lines.findIndex((line) => line.includes("-f, --fix"));
+    assert.ok(fixIndex >= 0);
+    assert.equal(lines[fixIndex].indexOf("Evaluate"), 34);
+    assert.equal(lines[fixIndex].slice(34), "Evaluate workflows and rewrite fixable fork-hostile");
+    assert.equal(lines[fixIndex + 1], " ".repeat(34) + "patterns.");
+
+    const failOnIndex = lines.findIndex((line) => line.includes("-l, --fail-on"));
+    assert.ok(failOnIndex >= 0);
+    assert.equal(lines[failOnIndex].slice(34), "Exit nonzero at error, warning, or none (error). --fix");
+    assert.equal(lines[failOnIndex + 1], " ".repeat(34) + "uses none.");
+
+    const pathIndex = lines.findIndex((line) => line.startsWith("  [path]"));
+    assert.ok(pathIndex >= 0);
+    assert.equal(lines[pathIndex + 1], " ".repeat(34) + "(current directory)");
+  }
+});
+
+test("NO_COLOR disables CLI help styling even when color is forced", () => {
+  const color = runCli(["--help"], { FORCE_COLOR: "1", NO_COLOR: "" });
+  const plain = runCli(["--help"], { FORCE_COLOR: "1", NO_COLOR: "1" });
+
+  assert.equal(plain.status, 0);
+  assert.equal(plain.stderr, "");
+  assert.doesNotMatch(plain.stdout, /\u001b/);
+  assert.equal(plain.stdout, color.stdout.replace(/\u001b\[[0-9;]*m/g, ""));
+});
+
+test("interactive legend widths ignore non-color CSI escape sequences", () => {
+  const items = [["a", "\u001b[2Kone"], ["b", "\u001b[?25ltwo"]];
+
+  assert.equal(buildInteractiveLegendLines(12, items).length, 1);
+  assert.equal(buildInteractiveLegendLines(11, items).length, 2);
+});
+
 test("resolves CLI version from environment override", () => {
   const originalVersion = process.env.FFACTIONS_VERSION;
   const originalBuildSha = process.env.FFACTIONS_BUILD_SHA;
