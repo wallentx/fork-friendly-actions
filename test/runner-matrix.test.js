@@ -61,6 +61,51 @@ const runnerMappings = [
   ["custom-public-runner", "custom-public-runner"],
 ];
 
+test("scalar runner fallbacks preserve the same OS/version/architecture as matrices", () => {
+  for (const [original, fallback] of runnerMappings) {
+    const source = YAML.stringify({
+      on: "pull_request",
+      jobs: { build: { "runs-on": original, steps: [{ run: "echo build" }] } },
+    });
+    const options = { ...scope, source, allowList: new Set(["custom-public-runner"]) };
+    const result = fixWorkflowFile(options);
+    const runner = YAML.parse(result.fixedSource).jobs.build["runs-on"];
+    if (original === fallback) {
+      assert.equal(runner, original);
+      assert.equal(result.changes.length, 0);
+    } else {
+      assert.equal(selectRunner(runner, {}, scope.upstreamRepo), original);
+      assert.equal(selectRunner(runner, {}, "Contributor/fork"), fallback, original);
+    }
+    assert.deepEqual(auditWorkflowFile({ ...options, source: result.fixedSource }), []);
+  }
+});
+
+test("matrix clause order is stable and earlier unsorted fixes remain accepted", () => {
+  const mappings = runnerMappings.slice(0, 4);
+  const runners = mappings.map(([runner]) => runner);
+  const first = fixWorkflowFile({ ...scope, source: workflow({ os: runners }) });
+  const reversed = fixWorkflowFile({ ...scope, source: workflow({ os: [...runners].reverse() }) });
+  const expression = YAML.parse(first.fixedSource).jobs.build["runs-on"];
+  assert.equal(YAML.parse(reversed.fixedSource).jobs.build["runs-on"], expression);
+
+  const clauses = [...mappings].reverse().map(([original, fallback]) => `matrix.os == '${original}' && '${fallback}'`);
+  const previous = YAML.parse(workflow({ os: runners }));
+  previous.jobs.build["runs-on"] = `\${{ github.repository == '${scope.upstreamRepo}' && (matrix.os) || (${clauses.join(" || ")} || matrix.os) }}`;
+  const source = YAML.stringify(previous);
+  assert.deepEqual(auditWorkflowFile({ ...scope, source }), []);
+  assert.equal(fixWorkflowFile({ ...scope, source }).changes.length, 0);
+
+  for (const unsafe of [
+    previous.jobs.build["runs-on"].replace("'ubuntu-22.04-arm'", "'private-runner'"),
+    previous.jobs.build["runs-on"].replace(" || matrix.os)", " || 'private-runner')"),
+    previous.jobs.build["runs-on"].replace(" || matrix.os)", " || 'private-runner' || matrix.os)"),
+  ]) {
+    previous.jobs.build["runs-on"] = unsafe;
+    assert.equal(auditWorkflowFile({ ...scope, source: YAML.stringify(previous) })[0].ruleCode, "FF002");
+  }
+});
+
 for (const shape of ["axis", "include", "nested"]) {
   test(`preserves platform and architecture for every ${shape} matrix runner`, () => {
     const rows = runnerMappings.map(([os], index) => ({
