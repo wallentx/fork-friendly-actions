@@ -10479,11 +10479,15 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, workflowModel, w
       };
     }
     if (!hasOwnerExpression || !hasFallback) {
+      // A single default cannot preserve an unresolved matrix's OS/architecture.
+      // Leave it for manual review instead of silently collapsing every leg.
+      const needsManualFallback = /\bmatrix\s*(?:\.|\[)/.test(expression) && !expressionFallback;
+      const fixable = Boolean(upstreamScope.guardExpression) && !needsManualFallback;
       const why = matrixResolution.referencedKeys && matrixResolution.referencedKeys.length > 0
         ? `Dynamic runs-on expression ${raw} depends on matrix values that could not be fully resolved to known public runners.`
         : `Dynamic runs-on expression ${raw} cannot be locally resolved to a known public GitHub-hosted runner.`;
       return {
-        fixable: Boolean(upstreamScope.guardExpression),
+        fixable,
         fixKind: "runs-on-fallback",
         fallbackExpression: expressionFallback,
         findings: [
@@ -10495,8 +10499,8 @@ function auditRunsOn({ relativeFile, lineNumber, runsOn, guard, workflowModel, w
             rule: RULES.RUNNER_EXPRESSION.slug,
             ruleCode: RULES.RUNNER_EXPRESSION.code,
             title: "Dynamic runner expression needs a fork fallback",
-            message: `${why} Dynamic expressions should clearly choose a known free public GitHub-hosted runner when the workflow runs outside the upstream repository.${formatScopeHint(upstreamScope)}`,
-            fixable: Boolean(upstreamScope.guardExpression),
+            message: `${why} Dynamic expressions should clearly choose a known free public GitHub-hosted runner when the workflow runs outside the upstream repository.${needsManualFallback ? " No compatible fallback could be determined for every matrix value; configure OS/architecture-compatible fallbacks manually." : ""}${formatScopeHint(upstreamScope)}`,
+            fixable,
           },
         ],
       };
@@ -10767,7 +10771,7 @@ function resolveIndexedMatrixReferenceValues(leftPathExpression, rightPathExpres
     }
   }
 
-  return sawIncludedCombination ? flattenMatrixResolvedValues(resolved) : [];
+  return sawIncludedCombination ? resolved : [];
 }
 
 function resolveMatrixPath(pathExpression, matrixValues) {
@@ -10775,7 +10779,7 @@ function resolveMatrixPath(pathExpression, matrixValues) {
   const rootKey = segments.shift();
   const rootValues = Array.isArray(matrixValues[rootKey]) ? matrixValues[rootKey] : [];
   if (segments.length === 0) {
-    return flattenMatrixResolvedValues(rootValues);
+    return rootValues;
   }
 
   let currentValues = rootValues;
@@ -10789,17 +10793,17 @@ function resolveMatrixPath(pathExpression, matrixValues) {
     }
     currentValues = nextValues;
   }
-  return flattenMatrixResolvedValues(currentValues);
+  return currentValues;
 }
 
 function buildMatrixScalarFallbackExpression(reference, values, allowList) {
-  const flattenedValues = flattenMatrixResolvedValues(values);
-  const scalarValues = flattenedValues.filter((value) => typeof value === "string");
-  if (scalarValues.length === 0 || scalarValues.length !== flattenedValues.length) {
+  // Keep each resolved runner's shape: array-valued references cannot match
+  // the scalar string comparisons emitted below.
+  if (values.length === 0 || values.some((value) => typeof value !== "string")) {
     return "";
   }
 
-  const mappings = scalarValues.map((value) => [value, mapForkFriendlyRunner(value, allowList)]);
+  const mappings = values.map((value) => [value, mapForkFriendlyRunner(value, allowList)]);
   if (mappings.some(([, mapped]) => !mapped)) {
     return "";
   }
@@ -10834,7 +10838,25 @@ function mapForkFriendlyRunner(label, allowList) {
   if (lower === "linux-arm64") {
     return "ubuntu-24.04-arm";
   }
-  return inferEquivalentPublicRunner([normalized]);
+  // Recognize documented label schemes, not arbitrary substrings in private
+  // labels: an unknown architecture must not become an x64 Ubuntu runner.
+  // https://docs.blacksmith.sh/blacksmith-runners/overview
+  const blacksmithUbuntu = lower.match(/^blacksmith-\d+vcpu-ubuntu-(22|24)04(-arm)?$/);
+  const blacksmithDesktop = lower.match(/^blacksmith-\d+vcpu-(macos-(?:15|26|latest)|windows-2025)$/);
+  // GitHub's macOS large runners are Intel; xlarge runners are ARM64.
+  // https://docs.github.com/en/actions/reference/runners/larger-runners
+  const macosLarger = lower.match(/^macos-(latest|\d+)-(large|xlarge)$/);
+  let fallback = "";
+  if (blacksmithUbuntu) {
+    fallback = `ubuntu-${blacksmithUbuntu[1]}.04${blacksmithUbuntu[2] || ""}`;
+  } else if (blacksmithDesktop) {
+    fallback = blacksmithDesktop[1];
+  } else if (macosLarger) {
+    fallback = macosLarger[2] === "large"
+      ? `macos-${macosLarger[1] === "latest" ? "26" : macosLarger[1]}-intel`
+      : `macos-${macosLarger[1]}`;
+  }
+  return PUBLIC_GITHUB_HOSTED_RUNNERS.has(fallback) ? fallback : "";
 }
 
 function flattenMatrixResolvedValues(values) {
