@@ -1489,14 +1489,6 @@ function helpLiteral(text) {
   return helpColor("literal", text);
 }
 
-function stripAnsi(text) {
-  return String(text).replace(/\u001b\[[0-9;]*m/g, "");
-}
-
-function visibleLength(text) {
-  return stripAnsi(text).length;
-}
-
 function wrapHelpText(firstIndent, continuationIndent, width, text) {
   const words = String(text).split(/\s+/).filter(Boolean);
   const lines = [];
@@ -1505,7 +1497,7 @@ function wrapHelpText(firstIndent, continuationIndent, width, text) {
 
   for (const word of words) {
     const candidate = line ? `${line} ${word}` : word;
-    if (line && visibleLength(candidate) > width) {
+    if (line && visibleTextWidth(candidate) > width) {
       lines.push(`${lineIndent}${line}`);
       line = word;
       lineIndent = continuationIndent;
@@ -1568,7 +1560,7 @@ function printHelp() {
   helpOption("-h", "--help", "", "Show this help.");
   console.log("");
   console.log(helpColor("section", "Arguments"));
-  printHelpOption("[path]", helpBracket("path"), "Project checkout, workflow directory, or workflow file. Default: current directory.");
+  printHelpOption("[path]", helpBracket("path"), `Project checkout, workflow directory, or workflow file ${helpDefault("current directory")}`);
 }
 
 if (require.main === module) {
