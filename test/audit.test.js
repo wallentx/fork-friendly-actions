@@ -1520,6 +1520,22 @@ test("prints CLI version without auditing workflows", () => {
   assert.equal(result.stderr, "");
 });
 
+test("prints colorized CLI help with styled usage", () => {
+  const result = runCli(["--help"], {
+    FORCE_COLOR: "1",
+    NO_COLOR: "",
+  });
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /^\u001b\[1;96mffactions\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[1;94mUsage\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[1;95mffactions\u001b\[0m \u001b\[1;32m\[\u001b\[0m\u001b\[3;94moptions\u001b\[0m\u001b\[1;32m\]\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[1;94mOptions\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[1;95m-f\u001b\[0m\u001b\[0;37m,\u001b\[0m \u001b\[1;95m--fix\u001b\[0m/);
+  assert.match(result.stdout, /\u001b\[1;94mArguments\u001b\[0m/);
+  assert.equal(result.stderr, "");
+});
+
 test("resolves CLI version from environment override", () => {
   const originalVersion = process.env.FFACTIONS_VERSION;
   const originalBuildSha = process.env.FFACTIONS_BUILD_SHA;
